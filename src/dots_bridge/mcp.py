@@ -37,6 +37,15 @@ class BridgeBackend(Protocol):
 
     async def reply_to_app(self, request_id: str, text: str) -> dict[str, Any]: ...
 
+    async def send_to_app(
+        self,
+        text: str,
+        *,
+        channel: str = "default",
+        metadata: dict[str, Any] | None = None,
+        idempotency_key: str,
+    ) -> dict[str, Any]: ...
+
     async def get_message(self, request_id: str) -> dict[str, Any]: ...
 
 
@@ -166,7 +175,7 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
     """Build the MCP endpoint used by dots, with draft webhook Events support."""
     mcp = FastMCP(
         "dots-bridge",
-        version="0.1.0",
+        version="0.2.0",
         auth=auth,
         instructions=(
             "This bridge connects its owner's application to this dot. Subscribe to "
@@ -175,6 +184,11 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
             "through this bridge, call reply_to_app with that request_id and your "
             "final response. get_message retrieves the original request. Only one "
             "final reply is stored per request; retry the same reply if needed. "
+            "When the owner authorizes proactive messages, call send_to_app to "
+            "send application messages without a prior request or subscription. "
+            "Use reply_to_app for responses to application requests so they remain "
+            "correlated. Give each new proactive message a unique idempotency_key "
+            "and reuse that key when retrying the same message. "
             "Continue to apply the owner's normal approval requirements."
         ),
     )
@@ -225,6 +239,51 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
         """
         try:
             return await bridge.reply_to_app(request_id, text)
+        except BridgeError as exc:
+            raise ToolError(f"{exc.code}: {exc.message}") from None
+
+    @mcp.tool(
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        auth=reply_auth,
+        meta=_security_meta("messages:reply"),
+    )
+    async def send_to_app(
+        text: Annotated[str, Field(min_length=1, max_length=64000)],
+        idempotency_key: Annotated[
+            str,
+            Field(
+                min_length=1,
+                max_length=128,
+                description=(
+                    "A stable unique key for this logical message. Reuse it when retrying "
+                    "the same message and choose a different key for every new message."
+                ),
+            ),
+        ],
+        channel: Annotated[str, Field(min_length=1, max_length=128, pattern=r"^[\w.-]+$")] = (
+            "default"
+        ),
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Send an owner-authorized proactive message to the application.
+
+        No prior application request or Events subscription is needed. Use
+        reply_to_app instead for a response to an existing request. Retrying
+        the same idempotency_key and message succeeds without duplicating it;
+        reusing the key with different content is rejected.
+        """
+        try:
+            return await bridge.send_to_app(
+                text,
+                channel=channel,
+                metadata=metadata,
+                idempotency_key=idempotency_key,
+            )
         except BridgeError as exc:
             raise ToolError(f"{exc.code}: {exc.message}") from None
 

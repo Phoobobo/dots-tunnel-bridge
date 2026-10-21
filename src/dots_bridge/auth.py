@@ -495,7 +495,8 @@ class PersonalOAuth(OAuthProvider):
         response = HTMLResponse(
             "<!doctype html><html><head><title>Connect dots-bridge</title></head>"
             "<body><h1>Connect dots-bridge</h1>"
-            "<p>Allow dots to receive your external messages and send replies.</p>"
+            "<p>Allow dots to receive your external messages "
+            "and send replies or proactive messages.</p>"
             f"<p>Requested permissions:</p><ul>{scopes}</ul>"
             '<form method="post" action="/consent">'
             f'<input type="hidden" name="request_id" value="{html.escape(request_id)}">'

@@ -9,6 +9,7 @@ from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 from typing import Any, TypeVar
+from uuid import uuid4
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -34,6 +35,16 @@ CREATE TABLE IF NOT EXISTS messages (
     event TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(delivery_status, next_attempt_at);
+CREATE TABLE IF NOT EXISTS received_messages (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('reply', 'push')), request_id TEXT UNIQUE,
+    channel TEXT NOT NULL, text TEXT NOT NULL, metadata TEXT NOT NULL,
+    received_at REAL NOT NULL, idempotency_key TEXT UNIQUE, fingerprint TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS received_messages_channel ON received_messages(channel, sequence);
+CREATE TABLE IF NOT EXISTS received_consumers (
+    consumer_id TEXT PRIMARY KEY, channel TEXT, cursor INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -73,7 +84,7 @@ class Store:
                 db.executescript(SCHEMA)
                 db.execute("BEGIN IMMEDIATE")
                 version = db.execute("SELECT value FROM bridge_meta WHERE key='schema'").fetchone()
-                if version and version[0] not in (b"1", b"2"):
+                if version and version[0] not in (b"1", b"2", b"3"):
                     raise BridgeError(
                         "storage_version", "Unsupported database schema version.", 500
                     )
@@ -84,11 +95,6 @@ class Store:
                             "ALTER TABLE messages ADD COLUMN "
                             "reply_cancelled INTEGER NOT NULL DEFAULT 0"
                         )
-                db.execute(
-                    "INSERT INTO bridge_meta VALUES ('schema', ?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (b"2",),
-                )
                 check = db.execute("SELECT value FROM bridge_meta WHERE key='key_check'").fetchone()
                 if check:
                     try:
@@ -105,6 +111,20 @@ class Store:
                         "INSERT INTO bridge_meta VALUES ('key_check', ?)",
                         (self.cipher.encrypt(b"dots-bridge"),),
                     )
+                # Keep older replies visible in the unified stream. The unique
+                # request_id makes this safe on migration retries and restarts.
+                replies = db.execute(
+                    "SELECT * FROM messages WHERE reply IS NOT NULL AND request_id NOT IN "
+                    "(SELECT request_id FROM received_messages WHERE request_id IS NOT NULL) "
+                    "ORDER BY COALESCE(replied_at, created_at), request_id"
+                ).fetchall()
+                for reply in replies:
+                    self._append_reply(db, reply)
+                db.execute(
+                    "INSERT INTO bridge_meta VALUES ('schema', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (b"3",),
+                )
 
             await self.run(setup)
             self._ready = True
@@ -275,11 +295,159 @@ class Store:
                 "UPDATE messages SET reply=?, replied_at=? WHERE request_id=?",
                 (text, time.time(), request_id),
             )
-            return dict(
-                db.execute("SELECT * FROM messages WHERE request_id=?", (request_id,)).fetchone()
+            saved = db.execute(
+                "SELECT * FROM messages WHERE request_id=?", (request_id,)
+            ).fetchone()
+            self._append_reply(db, saved)
+            return dict(saved)
+
+        return await self.run(save)
+
+    @staticmethod
+    def _append_reply(db: sqlite3.Connection, row: sqlite3.Row):
+        db.execute(
+            "INSERT INTO received_messages "
+            "(id, kind, request_id, channel, text, metadata, received_at, fingerprint) "
+            "VALUES (?, 'reply', ?, ?, ?, ?, ?, ?)",
+            (
+                str(uuid4()),
+                row["request_id"],
+                row["channel"],
+                row["reply"],
+                row["metadata"],
+                row["replied_at"] if row["replied_at"] is not None else row["created_at"],
+                row["fingerprint"],
+            ),
+        )
+
+    async def save_push(
+        self,
+        *,
+        text: str,
+        channel: str,
+        metadata: dict,
+        idempotency_key: str,
+        fingerprint: str,
+    ) -> dict:
+        def save(db):
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute(
+                "SELECT * FROM received_messages WHERE idempotency_key=?", (idempotency_key,)
+            ).fetchone()
+            if row:
+                if row["fingerprint"] != fingerprint:
+                    raise BridgeError(
+                        "idempotency_conflict",
+                        "This idempotency key was already used with different message content.",
+                        409,
+                    )
+                return public_received(dict(row))
+            message_id = str(uuid4())
+            db.execute(
+                "INSERT INTO received_messages "
+                "(id, kind, channel, text, metadata, received_at, idempotency_key, fingerprint) "
+                "VALUES (?, 'push', ?, ?, ?, ?, ?, ?)",
+                (
+                    message_id,
+                    channel,
+                    text,
+                    json.dumps(metadata, ensure_ascii=False),
+                    time.time(),
+                    idempotency_key,
+                    fingerprint,
+                ),
+            )
+            return public_received(
+                dict(
+                    db.execute(
+                        "SELECT * FROM received_messages WHERE id=?", (message_id,)
+                    ).fetchone()
+                )
             )
 
         return await self.run(save)
+
+    async def list_received(
+        self, *, after: int = 0, limit: int = 100, channel: str | None = None
+    ) -> list[dict]:
+        def query(db):
+            channel_clause = " AND channel=?" if channel is not None else ""
+            parameters = (after, channel, limit) if channel is not None else (after, limit)
+            return [
+                public_received(dict(row))
+                for row in db.execute(
+                    "SELECT * FROM received_messages WHERE sequence>?"
+                    + channel_clause
+                    + " ORDER BY sequence LIMIT ?",
+                    parameters,
+                )
+            ]
+
+        return await self.run(query)
+
+    async def latest_received_sequence(self, *, channel: str | None = None) -> int:
+        def query(db):
+            if channel is None:
+                row = db.execute("SELECT MAX(sequence) FROM received_messages").fetchone()
+            else:
+                row = db.execute(
+                    "SELECT MAX(sequence) FROM received_messages WHERE channel=?", (channel,)
+                ).fetchone()
+            return row[0] or 0
+
+        return await self.run(query)
+
+    @staticmethod
+    def _consumer_cursor(db: sqlite3.Connection, consumer_id: str, channel: str | None) -> int:
+        row = db.execute(
+            "SELECT channel, cursor FROM received_consumers WHERE consumer_id=?", (consumer_id,)
+        ).fetchone()
+        if row:
+            if row["channel"] != channel:
+                raise BridgeError(
+                    "consumer_channel_conflict",
+                    "This consumer ID is already bound to a different channel filter.",
+                    409,
+                )
+            return row["cursor"]
+        db.execute(
+            "INSERT INTO received_consumers (consumer_id, channel) VALUES (?, ?)",
+            (consumer_id, channel),
+        )
+        return 0
+
+    async def get_consumer_cursor(self, consumer_id: str, channel: str | None = None) -> int:
+        def query(db):
+            db.execute("BEGIN IMMEDIATE")
+            return self._consumer_cursor(db, consumer_id, channel)
+
+        return await self.run(query)
+
+    async def acknowledge_received(
+        self, consumer_id: str, sequence: int, channel: str | None = None
+    ) -> int:
+        def acknowledge(db):
+            db.execute("BEGIN IMMEDIATE")
+            cursor = self._consumer_cursor(db, consumer_id, channel)
+            if not isinstance(sequence, int) or isinstance(sequence, bool) or sequence < 0:
+                raise BridgeError("invalid_received_cursor", "Invalid received message sequence.")
+            if sequence:
+                row = db.execute(
+                    "SELECT channel FROM received_messages WHERE sequence=?", (sequence,)
+                ).fetchone()
+                if not row or (channel is not None and row["channel"] != channel):
+                    raise BridgeError(
+                        "invalid_received_cursor", "No matching received message at this sequence."
+                    )
+            if sequence > cursor:
+                db.execute(
+                    "UPDATE received_consumers SET cursor=? WHERE consumer_id=?",
+                    (sequence, consumer_id),
+                )
+                return sequence
+            return cursor
+
+        return await self.run(acknowledge)
 
     async def claim(self, max_attempts: int) -> dict | None:
         def claim(db):
@@ -373,4 +541,17 @@ def public_message(row: dict) -> dict[str, Any]:
         ),
         "reply": row["reply"],
         "replied_at": iso8601(row["replied_at"]) if row["replied_at"] else None,
+    }
+
+
+def public_received(row: dict) -> dict[str, Any]:
+    return {
+        "sequence": row["sequence"],
+        "id": row["id"],
+        "kind": row["kind"],
+        "request_id": row["request_id"],
+        "channel": row["channel"],
+        "text": row["text"],
+        "metadata": json.loads(row["metadata"]),
+        "received_at": iso8601(row["received_at"]),
     }

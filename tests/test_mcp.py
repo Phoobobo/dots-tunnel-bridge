@@ -18,6 +18,7 @@ class Backend:
 
     def __init__(self):
         self.calls = []
+        self.pushes = {}
 
     async def list_events(self):
         return [{"name": "app.message.created", "delivery": ["webhook"]}]
@@ -40,6 +41,18 @@ class Backend:
         if request_id == "missing":
             raise BridgeError("message_not_found", "Unknown request.", 404)
         return {"request_id": request_id, "text": text}
+
+    async def send_to_app(self, text, *, channel="default", metadata=None, idempotency_key):
+        self.calls.append(("send", text, channel, metadata, idempotency_key))
+        payload = {"text": text, "channel": channel, "metadata": metadata or {}}
+        if idempotency_key in self.pushes:
+            if self.pushes[idempotency_key] != payload:
+                raise BridgeError(
+                    "idempotency_conflict", "This key was used with different content.", 409
+                )
+        else:
+            self.pushes[idempotency_key] = payload
+        return {"id": idempotency_key, **payload}
 
 
 @asynccontextmanager
@@ -98,11 +111,18 @@ async def test_modern_discovery_and_tools_survive_sdk_wire_validation():
             "get_current_user",
             "get_message",
             "reply_to_app",
+            "send_to_app",
         }
         reply = next(tool for tool in tools if tool["name"] == "reply_to_app")
         assert reply["annotations"]["idempotentHint"] is True
         assert reply["_meta"]["securitySchemes"][0]["scopes"] == ["messages:reply"]
         assert reply["securitySchemes"] == reply["_meta"]["securitySchemes"]
+        push = next(tool for tool in tools if tool["name"] == "send_to_app")
+        assert push["annotations"]["idempotentHint"] is True
+        assert push["annotations"]["readOnlyHint"] is False
+        assert push["_meta"]["securitySchemes"][0]["scopes"] == ["messages:reply"]
+        assert push["securitySchemes"] == push["_meta"]["securitySchemes"]
+        assert set(push["inputSchema"]["required"]) == {"text", "idempotency_key"}
         result = (await call("tools/call", {"name": "get_current_user", "arguments": {}})).json()[
             "result"
         ]
@@ -168,6 +188,78 @@ async def test_reply_tools_call_backend_and_return_safe_errors():
 
 
 @pytest.mark.asyncio
+async def test_push_tool_needs_no_request_or_subscription_and_preserves_metadata():
+    backend = Backend()
+    async with rpc_client(backend) as call:
+        result = (
+            await call(
+                "tools/call",
+                {
+                    "name": "send_to_app",
+                    "arguments": {"text": "A reminder", "idempotency_key": "reminder_1"},
+                },
+            )
+        ).json()["result"]
+        assert result["structuredContent"]["text"] == "A reminder"
+        assert backend.calls == [("send", "A reminder", "default", None, "reminder_1")]
+
+        arguments = {
+            "text": "Job finished",
+            "channel": "jobs.1",
+            "metadata": {"job_id": 42, "results": ["ok", None]},
+            "idempotency_key": "job_42",
+        }
+        first = (await call("tools/call", {"name": "send_to_app", "arguments": arguments})).json()[
+            "result"
+        ]
+        repeated = (
+            await call("tools/call", {"name": "send_to_app", "arguments": arguments})
+        ).json()["result"]
+        assert repeated == first
+        assert len(backend.pushes) == 2
+        assert first["structuredContent"]["metadata"] == arguments["metadata"]
+        assert backend.calls[-1] == (
+            "send",
+            "Job finished",
+            "jobs.1",
+            arguments["metadata"],
+            "job_42",
+        )
+
+        conflict = (
+            await call(
+                "tools/call",
+                {"name": "send_to_app", "arguments": {**arguments, "text": "Changed"}},
+            )
+        ).json()["result"]
+        assert conflict["isError"] is True
+        assert "idempotency_conflict" in conflict["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"text": "Hello"},
+        {"text": "", "idempotency_key": "key"},
+        {"text": "x" * 64001, "idempotency_key": "key"},
+        {"text": "Hello", "idempotency_key": ""},
+        {"text": "Hello", "idempotency_key": "x" * 129},
+        {"text": "Hello", "idempotency_key": "key", "channel": ""},
+        {"text": "Hello", "idempotency_key": "key", "channel": "x" * 129},
+        {"text": "Hello", "idempotency_key": "key", "channel": "bad/channel"},
+        {"text": "Hello", "idempotency_key": "key", "metadata": ["not an object"]},
+    ],
+)
+async def test_push_tool_validates_arguments_before_backend_calls(arguments):
+    backend = Backend()
+    async with rpc_client(backend) as call:
+        result = (await call("tools/call", {"name": "send_to_app", "arguments": arguments})).json()
+        assert "error" in result or result.get("result", {}).get("isError") is True
+        assert backend.calls == []
+
+
+@pytest.mark.asyncio
 async def test_authenticated_http_enforces_event_and_reply_scopes():
     auth = StaticTokenVerifier(
         tokens={
@@ -177,17 +269,32 @@ async def test_authenticated_http_enforces_event_and_reply_scopes():
     )
     async with rpc_client(Backend(), auth=auth) as call:
         assert (await call("events/list")).status_code == 401
-    async with rpc_client(Backend(), auth=auth, token="read-token") as call:
+    backend = Backend()
+    async with rpc_client(backend, auth=auth, token="read-token") as call:
         assert "events" in (await call("events/list")).json()["result"]
         tools = (await call("tools/list")).json()["result"]["tools"]
-        assert "reply_to_app" not in {tool["name"] for tool in tools}
+        assert not {"reply_to_app", "send_to_app"} & {tool["name"] for tool in tools}
+        for name, arguments in (
+            ("reply_to_app", {"request_id": "req_1", "text": "Done"}),
+            ("send_to_app", {"text": "A reminder", "idempotency_key": "reminder_1"}),
+        ):
+            result = (await call("tools/call", {"name": name, "arguments": arguments})).json()
+            assert "error" in result or result.get("result", {}).get("isError") is True
+        assert backend.calls == []
+    backend = Backend()
+    async with rpc_client(backend, auth=auth, token="reply-token") as call:
+        error = (await call("events/list")).json()["error"]
+        assert error["data"]["reason"] == "insufficient_scope"
+        tools = (await call("tools/list")).json()["result"]["tools"]
+        assert {"reply_to_app", "send_to_app"} <= {tool["name"] for tool in tools}
         result = (
             await call(
                 "tools/call",
-                {"name": "reply_to_app", "arguments": {"request_id": "req_1", "text": "Done"}},
+                {
+                    "name": "send_to_app",
+                    "arguments": {"text": "A reminder", "idempotency_key": "reminder_1"},
+                },
             )
-        ).json()
-        assert "error" in result or result.get("result", {}).get("isError") is True
-    async with rpc_client(Backend(), auth=auth, token="reply-token") as call:
-        error = (await call("events/list")).json()["error"]
-        assert error["data"]["reason"] == "insufficient_scope"
+        ).json()["result"]
+        assert result["structuredContent"]["text"] == "A reminder"
+        assert backend.calls == [("send", "A reminder", "default", None, "reminder_1")]

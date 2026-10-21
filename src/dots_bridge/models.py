@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -23,6 +23,50 @@ class MessageInput(BaseModel):
         if not value.strip():
             raise ValueError("text must contain a non-whitespace character")
         return value
+
+
+class PushInput(MessageInput):
+    """A dots-origin message that does not require a preceding application request."""
+
+    text: str = Field(min_length=1, max_length=64000)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+
+class ReceivedMessage(BaseModel):
+    """One durable message received from dots, either a reply or a proactive push."""
+
+    model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
+
+    sequence: int = Field(ge=1)
+    id: str
+    kind: Literal["reply", "push"]
+    request_id: str | None
+    channel: str
+    text: str
+    metadata: dict[str, Any]
+    received_at: str
+
+
+class ReceivedAcknowledgement(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    sequence: int = Field(ge=0, le=2**63 - 1)
+    channel: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[\w.-]+$")
+
+
+class ReceivedQuery(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    after: int = Field(default=0, ge=0, le=2**63 - 1)
+    limit: int = Field(default=100, ge=1, le=100)
+    channel: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[\w.-]+$")
+
+
+class ReceivedConsumer(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    consumer_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
+    channel: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[\w.-]+$")
 
 
 EVENT_NAME = "app.message.created"

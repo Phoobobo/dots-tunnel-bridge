@@ -17,13 +17,17 @@ sequenceDiagram
     Dot-->>Bridge: HTTP受付（処理は非同期）
     Dot->>Bridge: reply_to_app(request_id, text)
     Bridge->>Bridge: 返信をSQLiteへ保存
-    App->>Bridge: GET /api/messages/{request_id}
-    Bridge-->>App: 保存済みの返信
+    Dot->>Bridge: send_to_app(text, idempotency_key)（自発メッセージ）
+    App->>Bridge: GET /api/received（バックグラウンド）
+    Bridge-->>App: 未処理の返信・自発メッセージ
+    App->>App: on_received(message)
+    App->>Bridge: 成功した処理位置をACK
 ```
 
-WebSocketは使いません。dotsへの配信はHTTPS POST、外部アプリによる返信の受け取りはHTTPポーリングです。
-`ask()`は送信と返信待ちをまとめたクライアントAPIです。
-OpenAI APIキーは不要です。dots側で、このMCPサーバーをプラグインとして接続・購読する必要があります。
+WebSocketは使いません。dotsへの配信はHTTPS POST、外部アプリの受信はバックグラウンドのHTTPポーリングです。
+`@bridge.on_received`で受信時の処理を登録でき、送信と受信を独立して動かせます。
+`ask()`で送信した依頼の返信を待つこともできます。
+OpenAI APIキーは不要です。dots側でMCPサーバーへOAuth接続し、外部アプリからdotsへ送る場合はイベントも購読します。
 
 ## インストール
 
@@ -40,7 +44,7 @@ wheelも作成できます。PyPIへの公開は別途行う作業です。
 ```sh
 python -m pip install build
 python -m build
-python -m pip install dist/dots_bridge-0.1.0-py3-none-any.whl
+python -m pip install dist/dots_bridge-0.2.0-py3-none-any.whl
 ```
 
 ## サーバーの起動
@@ -87,7 +91,7 @@ ngrok http 8765 --url https://YOUR-DOMAIN.ngrok.app
 2. MCP URLを`https://YOUR-DOMAIN.ngrok.app/mcp`、認証をOAuthにします。
 3. 登録画面に表示された**正確な**callback URLを、`bridge.toml`の`redirect_uri`に設定してサーバーを再起動します。
 4. 下表の値で登録・接続し、同意画面には`owner_key`を入力します。
-5. 公開一覧に`app.message.created`、`get_current_user`、`get_message`、`reply_to_app`が表示されることを確認します。変更後はツール・イベントを再スキャンします。
+5. 公開一覧に`app.message.created`、`get_current_user`、`get_message`、`reply_to_app`、`send_to_app`が表示されることを確認します。変更後はツール・イベントを再スキャンします。
 
 | 登録項目 | 値 |
 | --- | --- |
@@ -115,6 +119,15 @@ callback URLとWebhook secretは、購読時にdots側からサーバーへ渡�
 > 通常確認が必要な操作は、この経路でも確認してください。
 > 購読できたか、その結果も教えてください。
 
+dotsから依頼に紐づかないメッセージも送ってほしい場合は、その用途もdotsに伝えます。
+
+> 私が依頼した通知をアプリへ届ける場合は、send_to_appをchannel="default"で呼んでください。
+> idempotency_keyには通知ごとに一意な値を使い、同じ通知を再試行する場合は同じ値を使ってください。
+
+返信には`reply_to_app(request_id, text)`、自発メッセージには`send_to_app(text, idempotency_key, ...)`を使います。
+`send_to_app`は先行する依頼やイベント購読を必要としません。OAuth接続と`messages:reply`権限が必要です。
+dots側の画面や会話の文章が自動転送されるわけではなく、これらのツールを呼んだ内容がアプリへ届きます。
+
 プラグインの接続とイベント購読は別の手順です。購読は`subscriptions`で確認できます。
 
 ```sh
@@ -126,7 +139,88 @@ dots-bridge send "接続テストです。受信したと返信してくださ�
 同じchannelに複数の購読がある場合は、送信時の`subscription_id`を必須にしています。
 購読を解除するには、対象dotsに`app.message.created`の購読解除を依頼します。
 
-## Pythonから送信・返信取得
+## 受信時にコールバックを実行する
+
+別プロセスのアプリでは`AsyncBridgeClient`にハンドラーを登録し、`start_receiving()`で受信を開始します。
+`send_message()`はサーバーに依頼を保存したあとに戻ります。返信を待たずにアプリの処理を続けられます。
+
+```python
+import asyncio
+from dots_bridge import AsyncBridgeClient, ReceivedMessage, Settings
+
+
+async def main():
+    settings = Settings.from_file("bridge.toml")
+    async with AsyncBridgeClient("http://127.0.0.1:8765", api_key=settings.api_key) as bridge:
+
+        @bridge.on_received
+        async def received(message: ReceivedMessage):
+            # ここで表示、音声再生、アプリの状態更新などを行います。
+            print(message.kind, message.request_id, message.text)
+
+        await bridge.start_receiving(consumer_id="my-app", channel="default")
+        queued = await bridge.send_message("こんにちは。短く返信してください。")
+        print("queued:", queued["request_id"])
+        # ここからアプリのほかの処理を実行できます。
+        await asyncio.Event().wait()  # このサンプルはCtrl+Cまで受信を続けます。
+
+
+asyncio.run(main())
+```
+
+実行可能なサンプルは[examples/send_message.py](examples/send_message.py)です。
+コンテキストを抜けると受信タスクも停止します。手動では`await bridge.stop_receiving()`で停止できます。
+同期の`def`ハンドラーも登録でき、その場合はイベントループを止めないよう別スレッドで実行します。
+
+受け取る`ReceivedMessage`は次の属性を持ちます。
+
+| 属性 | 内容 |
+| --- | --- |
+| `text` | dotsからの本文 |
+| `kind` | 依頼への返信なら`reply`、自発メッセージなら`push` |
+| `request_id` | 返信元の依頼ID。自発メッセージなら`None` |
+| `channel` | 受信先のchannel |
+| `metadata` | 返信なら元の依頼のmetadata、自発メッセージならツールで指定したmetadata |
+| `id` | 受信メッセージの一意なID。再処理時も同じ値 |
+| `sequence` | 保存順に増加する受信番号 |
+| `received_at` | サーバーの受信日時（UTCのISO 8601） |
+
+登録順にハンドラーを実行し、全ハンドラーが成功してから処理位置をSQLiteへ保存します。
+ハンドラー失敗・通信の一時エラーはバックオフして再試行し、未処理の受信を飛ばしません。
+処理成功後のACKが失敗した場合などは同じ受信を再実行し得るため、外部への副作用は`message.id`で重複を防いでください。
+同期ハンドラーの実行中に受信を停止しても、既に動いている同期関数は中断しません。
+
+同じ`consumer_id`で再起動すると、保存した処理位置から再開します。
+新しいconsumerは保存済みの受信を先頭から処理します。既存DBの返信も初回のDB更新時に受信一覧へ移します。
+複数アプリへ配信する場合はそれぞれ別の`consumer_id`を使ってください。
+同じconsumerを複数プロセスで同時に動かさないでください。channelを変更する場合も別のconsumer IDを使います。
+`channel`を省略すると全channelを受信します。
+
+認証失敗など継続できないエラーでは受信を停止し、`bridge.receiving`が`False`、
+`bridge.receiver_error`がエラーになります。原因を解消して`start_receiving()`を再度呼ぶと再開できます。
+通信やハンドラーの一時的なエラーは受信タスク内で再試行します。
+
+同じサーバープロセスで処理する場合は、`DotsBridge`にも同じデコレーターを使えます。
+
+```python
+from dots_bridge import DotsBridge, ReceivedMessage, Settings, create_app
+
+settings = Settings.from_file("bridge.toml")
+bridge = DotsBridge(settings)
+
+
+@bridge.on_received
+async def received(message: ReceivedMessage):
+    print(message.kind, message.text)
+
+
+app = create_app(settings, bridge=bridge)
+```
+
+アプリのlifespan開始時に受信も開始し、終了時に停止します。
+この場合の既定consumer IDは`in-process`です。実行例は[examples/embedded.py](examples/embedded.py)です。
+
+## 送信した依頼の返信を待つ
 
 外部アプリには`api_key`だけを渡します。サーバーと同じ設定ファイルを読む場合の例です。
 
@@ -184,6 +278,15 @@ asyncio.run(main())
 | `POST /api/messages` | 依頼を保存して202を返す |
 | `GET /api/messages/{request_id}` | 配送状態と保存済みの返信を取得 |
 | `DELETE /api/subscriptions/{subscription_id}` | 購読を解除し、未配送依頼をキャンセル |
+| `GET /api/received?after=0&limit=100&channel=default` | 返信・自発メッセージの受信一覧（channelは省略可能） |
+| `GET /api/consumers/{consumer_id}?channel=default` | consumerの処理位置を取得・初期化 |
+| `POST /api/consumers/{consumer_id}/ack` | `{"sequence": 123, "channel": "default"}`で処理位置を進める |
+
+受信一覧の戻り値は`{"messages": [...]}`、consumer操作の戻り値は`{"cursor": 123}`です。
+`after`は指定番号よりあとの受信、`limit`は1〜100件です。
+通常はクライアントのバックグラウンド受信が一覧取得とACKを行います。
+手動で扱う場合は同期・非同期クライアントの`list_received()`、`get_consumer_cursor()`、`acknowledge_received()`を使えます。
+受信一覧の取得だけでは処理位置は進みません。
 
 送信JSONは次の形です。`text`以外は省略可能です。
 
@@ -233,7 +336,7 @@ OAuthのwell-knownと運用エンドポイントを公開originのルートか�
 ## 保存・再送・運用上の範囲
 
 - **単一所有者向けです。** 複数テナント・一般公開の本人確認基盤は提供しません。
-- 設定はTOML、購読、依頼、配送状態、返信、OAuth状態はSQLiteに保存します。
+- 設定はTOML、購読、依頼、配送状態、返信・自発メッセージ、受信処理位置、OAuth状態はSQLiteに保存します。
   OAuthアクセストークンは1時間、refresh tokenは30日です。再起動で接続状態を失いません。
 - Webhookのcallback URLとsecretはFernetで暗号化します。本文・返信・metadataを含むDB全体の暗号化は行いません。
   DB・設定・バックアップは所有者のみ読める場所に置いてください。
@@ -249,9 +352,11 @@ OAuthのwell-knownと運用エンドポイントを公開originのルートか�
   解除・失効・明示的なOAuth取消後は未配送を止めます。既に開始したHTTP要求は取り消せません。
 - イベント履歴のMCP cursor replayは提供せず、`cursor: null`を返します。
   内部outboxの再送と、MCPの履歴再生は別の機能です。`ttlMs: null`でも有限の購読期限を返します。
-- このパッケージが保存するのは返信ツールへ渡された本文です。
-  dotsが返信ツールを必ず呼ぶこと、即時に処理されることは保証できません。
-  dotsへの購読依頼で、返信方法を明示してください。
+- このパッケージが保存するのは`reply_to_app`・`send_to_app`へ渡された本文です。
+  dotsがツールを必ず呼ぶこと、即時に処理されることは保証できません。
+  dotsへの依頼で返信・通知方法を明示してください。
+- 受信一覧とconsumerの処理位置は`prune`で削除しません。依頼を削除しても未処理の返信を受信できます。
+  長期運用時はDB容量も確認してください。
 
 明示的にOAuth接続と購読を全て取り消す場合:
 

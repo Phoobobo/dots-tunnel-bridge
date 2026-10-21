@@ -14,7 +14,7 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet
 
-from dots_bridge import DotsBridge, Settings, create_app
+from dots_bridge import AsyncBridgeClient, DotsBridge, ReceivedMessage, Settings, create_app
 from dots_bridge.app import MAX_REQUEST_BYTES
 from dots_bridge.mcp import PROTOCOL_VERSION
 
@@ -327,6 +327,155 @@ async def test_sdk_revocation_deletes_subscriptions_and_cancels_queued_delivery(
         assert not webhook.events
 
 
+async def test_callback_receiver_handles_reply_and_unsolicited_push_over_http(tmp_path):
+    async with running_app(tmp_path) as (http, app, bridge, webhook):
+        token = (await login(http))["access_token"]
+        await subscribe(http, token)
+        seen = []
+        delivered = asyncio.Event()
+        async with AsyncBridgeClient(
+            BASE,
+            api_key=API_KEY,
+            transport=httpx.ASGITransport(app=app),
+        ) as client:
+
+            @client.on_received
+            async def receive(message: ReceivedMessage):
+                seen.append(message)
+                if len(seen) == 2:
+                    delivered.set()
+
+            await client.start_receiving(
+                consumer_id="callback-app", channel="chat", poll_interval=0.01
+            )
+            request = await client.send_message("返答してください", channel="chat")
+            assert request["reply"] is None
+            assert not seen
+            await bridge.process_next()
+            result = await rpc(
+                http,
+                token,
+                "tools/call",
+                {
+                    "name": "reply_to_app",
+                    "arguments": {
+                        "request_id": request["request_id"],
+                        "text": "返信です",
+                    },
+                },
+            )
+            assert not result.json()["result"].get("isError")
+            # Unsolicited messages work even with no active application subscription.
+            await bridge.revoke_subscriptions()
+            arguments = {
+                "text": "dotsからのお知らせ",
+                "channel": "chat",
+                "idempotency_key": "notification-1",
+                "metadata": {"topic": "news"},
+            }
+            for _ in range(2):
+                result = await rpc(
+                    http,
+                    token,
+                    "tools/call",
+                    {
+                        "name": "send_to_app",
+                        "arguments": arguments,
+                    },
+                )
+                assert not result.json()["result"].get("isError"), result.text
+            await asyncio.wait_for(delivered.wait(), 2)
+            assert [(m.kind, m.text) for m in seen] == [
+                ("reply", "返信です"),
+                ("push", "dotsからのお知らせ"),
+            ]
+            assert seen[0].request_id == request["request_id"]
+            assert seen[1].request_id is None
+            assert seen[1].metadata == {"topic": "news"}
+            async with asyncio.timeout(2):
+                # Callback completion precedes the durable acknowledgement.
+                while True:  # noqa: ASYNC110 - Poll persisted state.
+                    if (
+                        await client.get_consumer_cursor("callback-app", "chat")
+                        >= seen[-1].sequence
+                    ):
+                        break
+                    await asyncio.sleep(0.01)
+            await client.stop_receiving()
+            assert not client.receiving
+
+        # A new client resumes its consumer checkpoint and receives only new messages.
+        await bridge.send_to_app("再開後の通知", idempotency_key="notification-2", channel="chat")
+        resumed = []
+        done = asyncio.Event()
+        async with AsyncBridgeClient(
+            BASE,
+            api_key=API_KEY,
+            transport=httpx.ASGITransport(app=app),
+        ) as client:
+
+            @client.on_received
+            async def receive_after_restart(message):
+                resumed.append(message.text)
+                done.set()
+
+            await client.start_receiving(
+                consumer_id="callback-app", channel="chat", poll_interval=0.01
+            )
+            await asyncio.wait_for(done.wait(), 2)
+            assert resumed == ["再開後の通知"]
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "after=-1",
+        "after=abc",
+        "after=9223372036854775808",
+        "limit=0",
+        "limit=101",
+        "limit=1&limit=2",
+        "channel=bad/channel",
+        "unknown=value",
+    ],
+)
+async def test_received_api_rejects_invalid_queries(tmp_path, query):
+    async with running_app(tmp_path) as (client, app, bridge, webhook):
+        response = await client.get("/api/received?" + query, headers=bearer(API_KEY))
+        assert response.status_code == 422
+
+
+async def test_received_api_and_checkpoint_require_application_auth_and_validate_ack(tmp_path):
+    async with running_app(tmp_path) as (client, app, bridge, webhook):
+        token = (await login(client))["access_token"]
+        for path in ("/api/received", "/api/consumers/my-app"):
+            for key in (OWNER_KEY, token, "wrong"):
+                assert (await client.get(path, headers=bearer(key))).status_code == 401
+        assert (
+            await client.post("/api/consumers/my-app/ack", json={"sequence": 0})
+        ).status_code == 401
+        headers = bearer(API_KEY)
+        for value in (-1, True, 1.5, "1", 9223372036854775808):
+            response = await client.post(
+                "/api/consumers/my-app/ack", headers=headers, json={"sequence": value}
+            )
+            assert response.status_code == 422
+        response = await client.post(
+            "/api/consumers/my-app/ack", headers=headers, json={"sequence": 500}
+        )
+        assert response.status_code == 400
+        message = await bridge.send_to_app("通知", idempotency_key="push", channel="chat")
+        response = await client.post(
+            "/api/consumers/my-app/ack",
+            headers=headers,
+            json={"sequence": message["sequence"], "channel": "chat"},
+        )
+        assert response.json() == {"cursor": message["sequence"]}
+        assert (
+            await client.get("/api/consumers/my-app?channel=other", headers=headers)
+        ).status_code == 409
+
+
 @pytest.mark.asyncio
 async def test_lifespan_worker_delivers_without_manual_processing(tmp_path):
     async with running_app(tmp_path, start_worker=True) as (client, app, bridge, webhook):
@@ -388,7 +537,10 @@ async def test_real_oauth_narrowed_tokens_enforce_each_mcp_action_scope(tmp_path
         response = await rpc(client, reply_token, "events/list")
         assert response.json()["error"]["data"]["reason"] == "insufficient_scope"
         response = await rpc(client, reply_token, "tools/list")
-        assert {tool["name"] for tool in response.json()["result"]["tools"]} == {"reply_to_app"}
+        assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
+            "reply_to_app",
+            "send_to_app",
+        }
         response = await rpc(
             client,
             reply_token,

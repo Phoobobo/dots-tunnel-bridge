@@ -18,7 +18,7 @@ from .bridge import DotsBridge
 from .config import Settings
 from .errors import BridgeError
 from .mcp import create_mcp
-from .models import MessageInput
+from .models import MessageInput, ReceivedAcknowledgement
 
 MAX_REQUEST_BYTES = 300 * 1024
 
@@ -138,12 +138,7 @@ def create_app(
 
     async def submit(request: Request):
         authorize(request)
-        if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
-            raise BridgeError("invalid_content_type", "Expected application/json.", 415)
-        try:
-            payload = json.loads(await request.body(), parse_constant=lambda value: _invalid_json())
-        except (ValueError, UnicodeError, RecursionError):
-            raise BridgeError("invalid_json", "Expected a valid JSON request body.", 400) from None
+        payload = await parse_json(request)
         try:
             message = MessageInput.model_validate(payload)
         except ValidationError:
@@ -152,9 +147,69 @@ def create_app(
             ) from None
         return JSONResponse(await bridge.submit(message), status_code=202)
 
+    async def parse_json(request: Request):
+        if request.headers.get("content-type", "").split(";")[0].strip() != "application/json":
+            raise BridgeError("invalid_content_type", "Expected application/json.", 415)
+        try:
+            return json.loads(await request.body(), parse_constant=lambda value: _invalid_json())
+        except (ValueError, UnicodeError, RecursionError):
+            raise BridgeError("invalid_json", "Expected a valid JSON request body.", 400) from None
+
     async def get_message(request: Request):
         authorize(request)
         return JSONResponse(await bridge.get_message(request.path_params["request_id"]))
+
+    def query_parameters(request, allowed):
+        query = dict(request.query_params)
+        if set(query) - allowed or len(query) != len(request.query_params.multi_items()):
+            raise BridgeError(
+                "invalid_received_query", "Invalid or repeated query parameters.", 422
+            )
+        return query
+
+    async def received(request: Request):
+        authorize(request)
+        query = query_parameters(request, {"after", "limit", "channel"})
+        try:
+            after = int(query.get("after", 0))
+            limit = int(query.get("limit", 100))
+        except ValueError:
+            raise BridgeError(
+                "invalid_received_query", "after and limit must be integers.", 422
+            ) from None
+        return JSONResponse(
+            {
+                "messages": await bridge.list_received(
+                    after=after,
+                    limit=limit,
+                    channel=query.get("channel"),
+                )
+            }
+        )
+
+    async def consumer_cursor(request: Request):
+        authorize(request)
+        query = query_parameters(request, {"channel"})
+        cursor = await bridge.get_consumer_cursor(
+            request.path_params["consumer_id"],
+            channel=query.get("channel"),
+        )
+        return JSONResponse({"cursor": cursor})
+
+    async def acknowledge(request: Request):
+        authorize(request)
+        payload = await parse_json(request)
+        try:
+            acknowledgement = ReceivedAcknowledgement.model_validate(payload)
+        except ValidationError:
+            raise BridgeError(
+                "invalid_received_cursor", "Invalid sequence or channel.", 422
+            ) from None
+        cursor = await bridge.acknowledge_received(
+            request.path_params["consumer_id"],
+            **acknowledgement.model_dump(),
+        )
+        return JSONResponse({"cursor": cursor})
 
     async def delete_subscription(request: Request):
         authorize(request)
@@ -174,9 +229,9 @@ def create_app(
     async def lifespan(app):
         await bridge.initialize()
         async with mcp_app.router.lifespan_context(mcp_app):
-            if start_worker:
-                await bridge.start()
             try:
+                if start_worker:
+                    await bridge.start()
                 yield
             finally:
                 await bridge.close()
@@ -188,6 +243,9 @@ def create_app(
             Route("/api/subscriptions/{subscription_id}", delete_subscription, methods=["DELETE"]),
             Route("/api/messages", submit, methods=["POST"]),
             Route("/api/messages/{request_id}", get_message),
+            Route("/api/received", received),
+            Route("/api/consumers/{consumer_id}", consumer_cursor),
+            Route("/api/consumers/{consumer_id}/ack", acknowledge, methods=["POST"]),
             Mount("/", app=mcp_app),
         ],
         lifespan=lifespan,

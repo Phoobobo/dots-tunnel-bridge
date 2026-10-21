@@ -1,10 +1,28 @@
-"""Run from the repository root after connecting a dot: python examples/send_message.py"""
+"""Send independently and handle replies/pushes: python examples/send_message.py"""
 
-from dots_bridge import BridgeClient, Settings
+import asyncio
 
-settings = Settings.from_file("bridge.toml")
-with BridgeClient("http://127.0.0.1:8765", api_key=settings.api_key) as client:
-    message = client.send_message("接続テストです。受信したと返信してください。")
-    print("request_id:", message["request_id"])
-    result = client.wait_for_reply(message["request_id"], timeout=120)
-    print(result["reply"])
+from dots_bridge import AsyncBridgeClient, ReceivedMessage, Settings
+
+
+async def main():
+    settings = Settings.from_file("bridge.toml")
+    async with AsyncBridgeClient("http://127.0.0.1:8765", api_key=settings.api_key) as bridge:
+
+        @bridge.on_received
+        async def received(message: ReceivedMessage):
+            # Replace this with your application logic. id is stable across retries.
+            print(message.kind, message.request_id, message.text)
+
+        await bridge.start_receiving(consumer_id="example-app", channel="default")
+        message = await bridge.send_message("接続テストです。受信したと返信してください。")
+        print("queued:", message["request_id"])
+        # The application can perform other work here. Keep its event loop alive.
+        await asyncio.Event().wait()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

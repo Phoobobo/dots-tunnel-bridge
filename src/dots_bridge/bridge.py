@@ -13,10 +13,21 @@ from email.utils import parsedate_to_datetime
 from uuid import uuid4
 
 import httpx
+from pydantic import ValidationError
 
 from .config import Settings
 from .errors import BridgeError
-from .models import EVENT, EVENT_NAME, MessageInput, iso8601
+from .models import (
+    EVENT,
+    EVENT_NAME,
+    MessageInput,
+    PushInput,
+    ReceivedAcknowledgement,
+    ReceivedConsumer,
+    ReceivedQuery,
+    iso8601,
+)
+from .receiver import ReceivedDispatcher
 from .store import Store, public_message
 from .webhooks import post_webhook, signed_body, signing_key, validate_url
 
@@ -33,6 +44,12 @@ class DotsBridge:
         self.webhook_post = webhook_post
         self._worker: asyncio.Task | None = None
         self._wake = asyncio.Event()
+        self._has_received_handlers = False
+        self._receiver = ReceivedDispatcher(
+            list_received=self.list_received,
+            get_cursor=self.get_consumer_cursor,
+            acknowledge=self.acknowledge_received,
+        )
 
     async def initialize(self):
         await self.store.initialize()
@@ -41,13 +58,96 @@ class DotsBridge:
         await self.initialize()
         if self._worker is None:
             self._worker = asyncio.create_task(self._run_worker(), name="dots-bridge-delivery")
+        if self._has_received_handlers and not self.receiving:
+            await self.start_receiving()
 
     async def close(self):
+        await self.stop_receiving()
         if self._worker is not None:
             self._worker.cancel()
             with suppress(asyncio.CancelledError):
                 await self._worker
             self._worker = None
+
+    def on_received(self, handler):
+        """Register a sync or async handler for replies and unsolicited messages.
+
+        Register before the application's lifespan starts to start receiving
+        automatically, or call start_receiving() explicitly.
+        """
+        registered = self._receiver.on_received(handler)
+        self._has_received_handlers = True
+        return registered
+
+    @property
+    def receiving(self) -> bool:
+        return self._receiver.running
+
+    @property
+    def receiver_error(self) -> Exception | None:
+        return self._receiver.error
+
+    async def start_receiving(
+        self,
+        *,
+        consumer_id: str = "in-process",
+        channel: str | None = None,
+        poll_interval: float = 0.5,
+    ):
+        """Start background callbacks, resuming this consumer's persisted cursor."""
+        await self.initialize()
+        await self._receiver.start(
+            consumer_id=consumer_id,
+            channel=channel,
+            poll_interval=poll_interval,
+        )
+
+    async def stop_receiving(self):
+        await self._receiver.stop()
+
+    async def list_received(
+        self,
+        *,
+        after: int = 0,
+        limit: int = 100,
+        channel: str | None = None,
+    ) -> list[dict]:
+        try:
+            query = ReceivedQuery(after=after, limit=limit, channel=channel)
+        except ValidationError:
+            raise BridgeError(
+                "invalid_received_query", "Invalid after, limit or channel.", 422
+            ) from None
+        await self.initialize()
+        return await self.store.list_received(**query.model_dump())
+
+    async def get_consumer_cursor(self, consumer_id: str, channel: str | None = None) -> int:
+        self._validate_consumer(consumer_id, channel)
+        await self.initialize()
+        return await self.store.get_consumer_cursor(consumer_id, channel)
+
+    async def acknowledge_received(
+        self,
+        consumer_id: str,
+        sequence: int,
+        channel: str | None = None,
+    ) -> int:
+        self._validate_consumer(consumer_id, channel)
+        try:
+            ReceivedAcknowledgement(sequence=sequence, channel=channel)
+        except ValidationError:
+            raise BridgeError(
+                "invalid_received_cursor", "Invalid received message sequence.", 422
+            ) from None
+        await self.initialize()
+        return await self.store.acknowledge_received(consumer_id, sequence, channel)
+
+    @staticmethod
+    def _validate_consumer(consumer_id, channel):
+        try:
+            ReceivedConsumer(consumer_id=consumer_id, channel=channel)
+        except ValidationError:
+            raise BridgeError("invalid_consumer", "Invalid consumer_id or channel.", 422) from None
 
     async def list_events(self) -> list[dict]:
         return [deepcopy(EVENT)]
@@ -288,11 +388,54 @@ class DotsBridge:
             ) from None
         await self.initialize()
         row = await self.store.save_reply(request_id, text)
+        self._receiver.notify()
         return {
             "request_id": row["request_id"],
             "reply": row["reply"],
             "replied_at": iso8601(row["replied_at"]),
         }
+
+    async def send_to_app(
+        self,
+        text: str,
+        *,
+        idempotency_key: str,
+        channel: str = "default",
+        metadata: dict | None = None,
+    ) -> dict:
+        """Persist an unsolicited dots message independently of request/reply state."""
+        try:
+            message = PushInput(
+                text=text,
+                channel=channel,
+                metadata=metadata if metadata is not None else {},
+                idempotency_key=idempotency_key,
+            )
+            canonical = json.dumps(
+                {"text": message.text, "channel": message.channel, "metadata": message.metadata},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        except (ValidationError, TypeError, ValueError, RecursionError):
+            raise BridgeError(
+                "invalid_push",
+                "Expected valid text, channel, JSON metadata and idempotency_key.",
+                422,
+            ) from None
+        if len(canonical) > 262144:
+            raise BridgeError("message_too_large", "Serialized message exceeds 256 KiB.", 413)
+        await self.initialize()
+        result = await self.store.save_push(
+            text=message.text,
+            channel=message.channel,
+            metadata=message.metadata,
+            idempotency_key=message.idempotency_key,
+            fingerprint=hashlib.sha256(canonical).hexdigest(),
+        )
+        self._receiver.notify()
+        return result
 
     async def process_next(self) -> bool:
         """Deliver one due outbox entry. Also useful for deterministic worker tests."""

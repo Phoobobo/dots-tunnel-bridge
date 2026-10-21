@@ -11,7 +11,8 @@ from urllib.parse import quote
 import httpx
 
 from .errors import BridgeError
-from .models import MessageInput
+from .models import MessageInput, ReceivedMessage
+from .receiver import ReceivedDispatcher, ReceivedHandler, _cursor, _received
 
 
 class ReplyTimeoutError(TimeoutError):
@@ -36,6 +37,37 @@ def _message_path(request_id: str) -> str:
     if not isinstance(request_id, str) or not request_id or request_id in {".", ".."}:
         raise ValueError("request_id must be a nonempty message ID")
     return "/api/messages/" + quote(request_id, safe="")
+
+
+def _consumer_path(consumer_id: str) -> str:
+    if not isinstance(consumer_id, str) or not consumer_id or consumer_id in {".", ".."}:
+        raise ValueError("consumer_id must be a nonempty consumer ID")
+    return "/api/consumers/" + quote(consumer_id, safe="")
+
+
+def _received_params(after: int, limit: int, channel: str | None) -> dict[str, Any]:
+    if isinstance(after, bool) or not isinstance(after, int) or after < 0:
+        raise ValueError("after must be a nonnegative integer")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+        raise ValueError("limit must be an integer between 1 and 100")
+    result: dict[str, Any] = {"after": after, "limit": limit}
+    result.update(_channel_params(channel))
+    return result
+
+
+def _channel_params(channel: str | None) -> dict[str, str]:
+    if channel is None:
+        return {}
+    if not isinstance(channel, str) or not channel:
+        raise ValueError("channel must be a nonempty string or None")
+    return {"channel": channel}
+
+
+def _ack_payload(sequence: int, channel: str | None) -> dict[str, Any]:
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 0:
+        raise ValueError("sequence must be a nonnegative integer")
+    _channel_params(channel)
+    return {"sequence": sequence, "channel": channel}
 
 
 def _decode(response: httpx.Response) -> dict[str, Any]:
@@ -133,6 +165,33 @@ class BridgeClient:
     def list_subscriptions(self) -> list[dict[str, Any]]:
         return _subscriptions(_decode(self._client.get("/api/subscriptions")))
 
+    def list_received(
+        self, *, after: int = 0, limit: int = 100, channel: str | None = None
+    ) -> list[ReceivedMessage]:
+        """Read replies and pushes after a sequence, without acknowledging them."""
+        body = _decode(
+            self._client.get("/api/received", params=_received_params(after, limit, channel))
+        )
+        return _received(body.get("messages"))
+
+    def get_consumer_cursor(self, consumer_id: str, channel: str | None = None) -> int:
+        """Return this consumer's last acknowledged receipt sequence."""
+        body = _decode(
+            self._client.get(_consumer_path(consumer_id), params=_channel_params(channel))
+        )
+        return _cursor(body.get("cursor"))
+
+    def acknowledge_received(
+        self, consumer_id: str, sequence: int, channel: str | None = None
+    ) -> int:
+        """Advance one consumer's cursor after successful processing."""
+        body = _decode(
+            self._client.post(
+                _consumer_path(consumer_id) + "/ack", json=_ack_payload(sequence, channel)
+            )
+        )
+        return _cursor(body.get("cursor"))
+
     def send_message(
         self,
         text: str,
@@ -216,7 +275,7 @@ class BridgeClient:
 
 
 class AsyncBridgeClient:
-    """Asynchronous application client with the same operations as BridgeClient."""
+    """Async client supporting independent sending and background receive callbacks."""
 
     def __init__(
         self,
@@ -234,19 +293,87 @@ class AsyncBridgeClient:
             follow_redirects=False,
             transport=transport,
         )
+        self._receiver = ReceivedDispatcher(
+            list_received=self.list_received,
+            get_cursor=self.get_consumer_cursor,
+            acknowledge=self.acknowledge_received,
+        )
 
     async def __aenter__(self) -> AsyncBridgeClient:
         await self._client.__aenter__()
         return self
 
     async def __aexit__(self, *args: Any) -> None:
+        await self.stop_receiving()
         await self._client.__aexit__(*args)
 
     async def aclose(self) -> None:
+        await self.stop_receiving()
         await self._client.aclose()
 
     async def list_subscriptions(self) -> list[dict[str, Any]]:
         return _subscriptions(_decode(await self._client.get("/api/subscriptions")))
+
+    @property
+    def receiving(self) -> bool:
+        """Whether the background receiver is running."""
+        return self._receiver.running
+
+    @property
+    def receiver_error(self) -> Exception | None:
+        """The terminal background error, if reception stopped unexpectedly."""
+        return self._receiver.error
+
+    def on_received(self, handler: ReceivedHandler) -> ReceivedHandler:
+        """Register a callback for both replies and unsolicited messages from dots."""
+        return self._receiver.on_received(handler)
+
+    async def start_receiving(
+        self,
+        *,
+        consumer_id: str = "default",
+        channel: str | None = None,
+        poll_interval: float = 0.5,
+    ) -> None:
+        """Start background dispatch, resuming this consumer's durable cursor.
+
+        Callback delivery is at least once: all callbacks must succeed before a
+        receipt is acknowledged. Failed callbacks are retried with backoff.
+        """
+        await self._receiver.start(
+            consumer_id=consumer_id, channel=channel, poll_interval=poll_interval
+        )
+
+    async def stop_receiving(self) -> None:
+        """Cancel and await background reception; leave pending receipts unacked."""
+        await self._receiver.stop()
+
+    async def list_received(
+        self, *, after: int = 0, limit: int = 100, channel: str | None = None
+    ) -> list[ReceivedMessage]:
+        """Read replies and pushes after a sequence, without acknowledging them."""
+        body = _decode(
+            await self._client.get("/api/received", params=_received_params(after, limit, channel))
+        )
+        return _received(body.get("messages"))
+
+    async def get_consumer_cursor(self, consumer_id: str, channel: str | None = None) -> int:
+        """Return this consumer's last acknowledged receipt sequence."""
+        body = _decode(
+            await self._client.get(_consumer_path(consumer_id), params=_channel_params(channel))
+        )
+        return _cursor(body.get("cursor"))
+
+    async def acknowledge_received(
+        self, consumer_id: str, sequence: int, channel: str | None = None
+    ) -> int:
+        """Advance one consumer's cursor after successful processing."""
+        body = _decode(
+            await self._client.post(
+                _consumer_path(consumer_id) + "/ack", json=_ack_payload(sequence, channel)
+            )
+        )
+        return _cursor(body.get("cursor"))
 
     async def send_message(
         self,
