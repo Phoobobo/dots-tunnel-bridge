@@ -29,17 +29,18 @@ See the [OpenAI MCP Events documentation](https://developers.openai.com/plugins/
 
 ### 1. Install
 
-From the root of this repository:
+Clone the repository and install:
 
 ```sh
-python -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/uezo/dots-bridge.git
+cd dots-bridge
+
 python -m pip install -e '.[chat]'
 ```
 
 Installation is currently from the repository. The `[chat]` extra adds dependencies for the interactive examples.
 For application integration alone, use `python -m pip install -e .`.
-Run Python and CLI commands in this virtual environment; activate it in each new terminal with `source .venv/bin/activate`.
+Use a virtual environment if needed.
 
 ### 2. Start and expose the bridge
 
