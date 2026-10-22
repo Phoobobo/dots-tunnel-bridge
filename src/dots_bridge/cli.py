@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import sys
 import time
 from collections.abc import Sequence
@@ -102,6 +103,16 @@ def _print_json(value) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
 
 
+def _configure_connector_logging() -> None:
+    """Show safe connector lifecycle diagnostics for the standalone CLI."""
+    logger = logging.getLogger("dots_bridge.connectors.openai")
+    if not logger.hasHandlers():
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+        logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+
 async def _maintenance(settings: Settings, command: str, days: float = 30) -> dict:
     from .bridge import DotsBridge
 
@@ -157,6 +168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
             from .connectors.openai import create_openai_connector
 
+            _configure_connector_logging()
             uvicorn.run(
                 create_openai_connector(
                     args.url or _local_url(settings),

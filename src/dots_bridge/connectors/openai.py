@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 import secrets
 import time
@@ -41,6 +42,49 @@ from ._websocket_push import WebSocketPushSession
 MAX_REQUEST_BYTES = 300 * 1024
 MAX_QUEUED_RESPONSES = 16
 HEARTBEAT_SECONDS = 15.0
+logger = logging.getLogger(__name__)
+
+
+def _log_token(value: Any) -> str:
+    """Keep upstream identifiers and error codes out of free-form log messages."""
+    if value is None:
+        return "-"
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,200}", value):
+        return value
+    return "invalid"
+
+
+def _log_lifecycle(
+    event: str,
+    *,
+    protocol: str,
+    started: float,
+    reply_timeout: float,
+    request_id: str | None = None,
+    code: str | None = None,
+    error_type: str | None = None,
+) -> None:
+    fields = {
+        "event": event,
+        "protocol": protocol,
+        "request_id": _log_token(request_id),
+        "code": _log_token(code),
+        "elapsed": round(max(0.0, time.monotonic() - started), 3),
+        "reply_timeout": reply_timeout,
+        "error_type": _log_token(error_type),
+    }
+    logger.log(
+        logging.WARNING if event == "request_error" else logging.INFO,
+        "event=%s protocol=%s request_id=%s code=%s elapsed=%.3fs reply_timeout=%.3fs%s",
+        fields["event"],
+        fields["protocol"],
+        fields["request_id"],
+        fields["code"],
+        fields["elapsed"],
+        fields["reply_timeout"],
+        "" if error_type is None else " error_type=" + fields["error_type"],
+        extra=fields,
+    )
 
 
 def _json(value: Any) -> str:
@@ -188,6 +232,27 @@ def _error_response(error: Exception, request_id: str | None = None) -> JSONResp
     return JSONResponse(body, status_code=status, headers=headers)
 
 
+def _log_failure(
+    error: Exception,
+    *,
+    protocol: str,
+    started: float,
+    reply_timeout: float,
+    request_id: str | None = None,
+) -> tuple[int, dict[str, Any]]:
+    status, body = _error(error, request_id)
+    _log_lifecycle(
+        "request_error",
+        protocol=protocol,
+        started=started,
+        reply_timeout=reply_timeout,
+        request_id=body["error"].get("request_id"),
+        code=body["error"]["code"],
+        error_type=type(error).__name__,
+    )
+    return status, body
+
+
 async def _cancel(task: asyncio.Task) -> None:
     if not task.done():
         task.cancel()
@@ -265,6 +330,8 @@ def create_openai_connector(
 
     async def completions(request: Request):
         request_id = None
+        started = time.monotonic()
+        protocol = "chat.completions"
         try:
             _authorize(request, api_key)
             payload = await _read_json(request)
@@ -274,11 +341,20 @@ def create_openai_connector(
             stream = payload.get("stream", False)
             if not isinstance(stream, bool):
                 raise ProtocolError("stream must be a boolean.", param="stream")
+            if stream:
+                protocol = "chat.completions.stream"
             stream_options = payload.get("stream_options")
             if stream_options is not None and not isinstance(stream_options, dict):
                 raise ProtocolError("stream_options must be an object.", param="stream_options")
             request_id = await enqueue(
                 text, requested_model, "chat.completions", _idempotency_key(request)
+            )
+            _log_lifecycle(
+                "request_accepted",
+                protocol=protocol,
+                started=started,
+                reply_timeout=reply_timeout,
+                request_id=request_id,
             )
             completion_id = "chatcmpl-" + request_id
             created = int(time.time())
@@ -290,6 +366,7 @@ def create_openai_connector(
                         created,
                         requested_model,
                         bool(stream_options and stream_options.get("include_usage")),
+                        started,
                     ),
                     media_type="text/event-stream",
                     headers={
@@ -307,6 +384,13 @@ def create_openai_connector(
                 result = await task
             finally:
                 await _cancel(task)
+            _log_lifecycle(
+                "final_received",
+                protocol=protocol,
+                started=started,
+                reply_timeout=reply_timeout,
+                request_id=request_id,
+            )
             return JSONResponse(
                 chat_completion(
                     result, completion_id=completion_id, created=created, model=requested_model
@@ -314,9 +398,18 @@ def create_openai_connector(
                 headers={"X-Dots-Request-ID": request_id},
             )
         except (ProtocolError, BridgeError, ReplyTimeoutError, httpx.HTTPError) as error:
+            _log_failure(
+                error,
+                protocol=protocol,
+                started=started,
+                reply_timeout=reply_timeout,
+                request_id=request_id,
+            )
             return _error_response(error, request_id)
 
-    async def completion_stream(request_id, completion_id, created, requested_model, include_usage):
+    async def completion_stream(
+        request_id, completion_id, created, requested_model, include_usage, started
+    ):
         messages = bridge_client.iter_responses(request_id, timeout=reply_timeout)
         task = asyncio.create_task(anext(messages))
         try:
@@ -335,6 +428,13 @@ def create_openai_connector(
                     raise BridgeError(
                         "invalid_response", "Response ended before a final reply.", 502
                     ) from None
+                _log_lifecycle(
+                    "final_received" if message.kind == "reply" else "progress_received",
+                    protocol="chat.completions.stream",
+                    started=started,
+                    reply_timeout=reply_timeout,
+                    request_id=request_id,
+                )
                 text = message.text + ("\n\n" if message.kind == "progress" else "")
                 chunks = chat_chunks(
                     text, completion_id=completion_id, created=created, model=requested_model
@@ -354,7 +454,14 @@ def create_openai_connector(
             if include_usage:
                 yield "data: " + _json({**opening, "choices": [], "usage": None}) + "\n\n"
         except (BridgeError, ReplyTimeoutError, httpx.HTTPError) as error:
-            yield "data: " + _json(_error(error, request_id)[1]) + "\n\n"
+            _, body = _log_failure(
+                error,
+                protocol="chat.completions.stream",
+                started=started,
+                reply_timeout=reply_timeout,
+                request_id=request_id,
+            )
+            yield "data: " + _json(body) + "\n\n"
         finally:
             with CancelScope(shield=True):
                 await _cancel(task)
@@ -362,9 +469,16 @@ def create_openai_connector(
         yield "data: [DONE]\n\n"
 
     async def responses(socket: WebSocket):
+        connected = time.monotonic()
         try:
             _authorize(socket, api_key)
         except ProtocolError as error:
+            _log_failure(
+                error,
+                protocol="responses.websocket",
+                started=connected,
+                reply_timeout=reply_timeout,
+            )
             if "websocket.http.response" in socket.scope.get("extensions", {}):
                 await socket.send_denial_response(_error_response(error))
             else:
@@ -386,6 +500,7 @@ def create_openai_connector(
         )
 
         async def run_response(payload):
+            started = time.monotonic()
             requested_model = _model(payload, model)
             response_id = "resp_" + uuid.uuid4().hex
             created = int(time.time())
@@ -405,11 +520,25 @@ def create_openai_connector(
                 request_id = await enqueue(
                     latest_response_text(payload), requested_model, "responses.websocket"
                 )
+                _log_lifecycle(
+                    "request_accepted",
+                    protocol="responses.websocket",
+                    started=started,
+                    reply_timeout=reply_timeout,
+                    request_id=request_id,
+                )
                 messages = bridge_client.iter_responses(request_id, timeout=reply_timeout)
                 try:
                     final_received = False
                     async for message in messages:
                         final_received = message.kind == "reply"
+                        _log_lifecycle(
+                            "final_received" if final_received else "progress_received",
+                            protocol="responses.websocket",
+                            started=started,
+                            reply_timeout=reply_timeout,
+                            request_id=request_id,
+                        )
                         for event in event_stream.message(
                             message.text,
                             final=final_received,
@@ -424,10 +553,19 @@ def create_openai_connector(
                     with CancelScope(shield=True):
                         await messages.aclose()
             except (BridgeError, ReplyTimeoutError, httpx.HTTPError) as error:
-                _, body = _error(error, request_id)
+                _, body = _log_failure(
+                    error,
+                    protocol="responses.websocket",
+                    started=started,
+                    reply_timeout=reply_timeout,
+                    request_id=request_id,
+                )
                 for event in event_stream.fail(
                     error={"code": "server_error", "message": body["error"]["message"]},
-                    metadata={"dots_bridge_request_id": request_id} if request_id else {},
+                    metadata={
+                        "dots_bridge_error_code": body["error"]["code"],
+                        **({"dots_bridge_request_id": request_id} if request_id else {}),
+                    },
                 ):
                     await send_event(event)
 
@@ -450,6 +588,7 @@ def create_openai_connector(
                 if message["type"] == "websocket.disconnect":
                     break
                 payload = None
+                started = time.monotonic()
                 try:
                     if message.get("text") is None:
                         raise ProtocolError("Send JSON as a text WebSocket message.")
@@ -489,7 +628,12 @@ def create_openai_connector(
                             code="rate_limit_exceeded",
                         ) from None
                 except (ProtocolError, BridgeError, httpx.HTTPError) as error:
-                    status, body = _error(error)
+                    status, body = _log_failure(
+                        error,
+                        protocol="responses.websocket",
+                        started=started,
+                        reply_timeout=reply_timeout,
+                    )
                     event = {"type": "error", "status": status, **body}
                     if isinstance(payload, dict):
                         failed_stream = payload.get("stream_id")

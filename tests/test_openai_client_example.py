@@ -3,12 +3,14 @@
 import asyncio
 import importlib.util
 import json
+import re
 import sys
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "openai_client.py"
@@ -44,20 +46,36 @@ class PendingSession:
             self.cancelled.set()
 
 
-def chunk(text=None, *, kind=None, finish=None, choices=True):
+def chunk(text=None, *, kind=None, finish=None, choices=True, request_id=None):
+    metadata = {"kind": kind} if kind else {}
+    if request_id is not None:
+        metadata["request_id"] = request_id
     return SimpleNamespace(
         choices=[SimpleNamespace(delta=SimpleNamespace(content=text), finish_reason=finish)]
         if choices
         else [],
-        dots_bridge={"kind": kind} if kind else None,
+        dots_bridge=metadata or None,
     )
 
 
+class APIError(Exception):
+    """The SDK exception attributes used by the example, without importing OpenAI."""
+
+    def __init__(self, message, *, body=None, code=None, status_code=None, request_id=None):
+        super().__init__(message)
+        self.message = message
+        self.body = body
+        self.code = code
+        self.status_code = status_code
+        self.request_id = request_id
+
+
 class FakeStream:
-    def __init__(self, chunks):
+    def __init__(self, chunks, *, headers=None):
         self.chunks = deque(chunks)
         self.entered = False
         self.closed = False
+        self.response = SimpleNamespace(headers=httpx.Headers(headers or {}))
 
     async def __aenter__(self):
         self.entered = True
@@ -79,11 +97,12 @@ class FakeStream:
 
 
 class FakeCompletions:
-    def __init__(self, *, failures=None, blocked=()):
+    def __init__(self, *, failures=None, blocked=(), stream_overrides=None):
         self.requests = []
         self.streams = []
         self.failures = failures or {}
         self.blocked = set(blocked)
+        self.stream_overrides = stream_overrides or {}
         self.started = asyncio.Event()
         self.release = asyncio.Event()
 
@@ -96,6 +115,10 @@ class FakeCompletions:
         if error := self.failures.get(text):
             raise error
         if payload.get("stream"):
+            if text in self.stream_overrides:
+                stream = FakeStream(**self.stream_overrides[text])
+                self.streams.append(stream)
+                return stream
             chunks = [
                 chunk(""),
                 chunk("進捗: " + text + "\n\n", kind="progress"),
@@ -168,7 +191,15 @@ def response_events(text, *, response_id, stream_id=None):
 
 
 class FakeConnection:
-    def __init__(self, *, auto_reply=True, failed=(), request_errors=(), subscription_error=False):
+    def __init__(
+        self,
+        *,
+        auto_reply=True,
+        failed=(),
+        request_errors=(),
+        subscription_error=False,
+        event_overrides=None,
+    ):
         self.response = SimpleNamespace(create=self.create_response)
         self.incoming = asyncio.Queue()
         self.sent = []
@@ -177,6 +208,7 @@ class FakeConnection:
         self.failed = set(failed)
         self.request_errors = set(request_errors)
         self.subscription_error = subscription_error
+        self.event_overrides = event_overrides or {}
         self.consumer_id = None
         self.connected = asyncio.Event()
         self.closed = False
@@ -213,7 +245,14 @@ class FakeConnection:
         self.requests.append(payload)
         text = payload["input"]
         response_id = f"resp_{len(self.requests)}"
-        if text in self.request_errors:
+        if text in self.event_overrides:
+            self.publish(
+                *[
+                    {**event, "stream_id": payload["stream_id"]}
+                    for event in self.event_overrides[text]
+                ]
+            )
+        elif text in self.request_errors:
             self.publish(
                 {
                     "type": "error",
@@ -375,6 +414,155 @@ async def test_rest_error_reports_safe_type_and_continues_without_resending(caps
     assert "RuntimeError" in output
     assert "private-request-details" not in output
     assert "dots> 返信: 次" in output
+    assert re.search(r"elapsed=\d+(?:\.\d+)?s", output)
+
+
+@pytest.mark.parametrize("mode", ["chat", "stream"])
+@pytest.mark.parametrize("wrapped", [False, True])
+async def test_sdk_error_details_explain_failure_and_keep_bridge_request_id(mode, wrapped, capsys):
+    details = {
+        "code": "bridge_reply_timeout",
+        "message": "Timed out waiting for dots; the request remains running.",
+        "request_id": "req_diagnostic_body",
+    }
+    error = APIError(
+        "SDK request failed",
+        body={"error": details} if wrapped else details,
+        status_code=504 if mode == "chat" else None,
+    )
+    if mode == "chat":
+        client = FakeClient(failures={"失敗": error})
+    else:
+        client = FakeClient(
+            stream_overrides={
+                "失敗": {
+                    "chunks": [
+                        chunk("まだ作業中です\n\n", kind="progress"),
+                        error,
+                    ]
+                }
+            }
+        )
+    await example.run_chat(client, ScriptedSession("失敗", "次", "/exit"), mode=mode)
+    output = capsys.readouterr().out
+    assert "APIError" in output
+    assert details["code"] in output
+    assert details["message"] in output
+    assert details["request_id"] in output
+    assert re.search(r"elapsed=\d+(?:\.\d+)?s", output)
+    if mode == "chat":
+        assert "504" in output
+    assert "dots> 返信: 次" in output
+    assert len(client.chat.completions.requests) == 2
+    assert all(stream.closed for stream in client.chat.completions.streams)
+
+
+async def test_sdk_error_attributes_are_used_when_no_structured_body_is_available(capsys):
+    error = APIError(
+        "The connector is temporarily rate limited.",
+        code="rate_limit_exceeded",
+        status_code=429,
+        request_id="req_sdk_attribute",
+    )
+    client = FakeClient(failures={"失敗": error})
+    await example.run_chat(client, ScriptedSession("失敗", "/exit"))
+    output = capsys.readouterr().out
+    assert error.message in output
+    assert "rate_limit_exceeded" in output
+    assert "429" in output
+    assert "req_sdk_attribute" in output
+    assert re.search(r"elapsed=\d+(?:\.\d+)?s", output)
+
+
+async def test_stream_error_uses_progress_request_id_when_body_has_none(capsys):
+    error = APIError(
+        "SDK interrupted",
+        body={
+            "code": "bridge_unavailable",
+            "message": "The bridge connection was interrupted.",
+        },
+    )
+    client = FakeClient(
+        stream_overrides={
+            "失敗": {
+                "chunks": [
+                    chunk(
+                        "作業を続けています\n\n", kind="progress", request_id="req_from_progress"
+                    ),
+                    error,
+                ]
+            }
+        }
+    )
+    await example.run_chat(client, ScriptedSession("失敗", "/exit"), mode="stream")
+    output = capsys.readouterr().out
+    assert "progress> 作業を続けています" in output
+    assert "bridge_unavailable" in output
+    assert "req_from_progress" in output
+    assert client.chat.completions.streams[0].closed
+
+
+async def test_stream_failure_before_first_chunk_uses_response_header_request_id(capsys):
+    error = APIError(
+        "SDK interrupted",
+        body={
+            "code": "bridge_unavailable",
+            "message": "The stream failed before its first chunk.",
+        },
+    )
+    client = FakeClient(
+        stream_overrides={
+            "失敗": {
+                "chunks": [error],
+                "headers": {"X-Dots-Request-ID": "req_before_first_chunk"},
+            }
+        }
+    )
+    await example.run_chat(client, ScriptedSession("失敗", "/exit"), mode="stream")
+    output = capsys.readouterr().out
+    assert "bridge_unavailable" in output
+    assert "req_before_first_chunk" in output
+    assert re.search(r"elapsed=\d+(?:\.\d+)?s", output)
+    assert client.chat.completions.streams[0].closed
+
+
+async def test_elapsed_includes_wait_after_progress_without_modifying_asyncio_clock(
+    monkeypatch, capsys
+):
+    clock = SimpleNamespace(now=100.0)
+    # Replace the example's module binding, not time.monotonic globally: the
+    # event loop must keep using its real clock for cancellation and scheduling.
+    monkeypatch.setattr(example, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    error = APIError(
+        "SDK error",
+        body={
+            "code": "bridge_reply_timeout",
+            "message": "Waiting for dots reached the deadline.",
+        },
+    )
+
+    class TimedStream(FakeStream):
+        async def __anext__(self):
+            try:
+                return await super().__anext__()
+            except APIError:
+                clock.now = 220.0
+                raise
+
+    stream = TimedStream([chunk("進捗です\n\n", kind="progress"), error])
+    client = FakeClient()
+
+    async def create(**payload):
+        client.chat.completions.requests.append(payload)
+        return stream
+
+    client.chat.completions.create = create
+    await example.run_chat(client, ScriptedSession("失敗", "/exit"), mode="stream")
+    output = capsys.readouterr().out
+    assert "elapsed=120.0s" in output
+    assert "bridge_reply_timeout" in output
+    assert stream.closed
+    assert len(client.chat.completions.requests) == 1
 
 
 async def test_stream_labels_progress_and_reply_and_closes_each_turn(capsys):
@@ -491,6 +679,108 @@ async def test_websocket_correlated_request_error_is_not_a_subscription_failure(
     assert "system>" in output
     assert "dots> 返信: next" in output
     assert len(client.responses.connects) == 1
+
+
+@pytest.mark.parametrize(
+    "event, expected",
+    [
+        (
+            {
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "code": "bridge_reply_timeout",
+                        "message": "Dots did not reply before the deadline.",
+                    },
+                    "metadata": {"dots_bridge_request_id": "req_ws_failed"},
+                },
+            },
+            ["bridge_reply_timeout", "Dots did not reply before the deadline.", "req_ws_failed"],
+        ),
+        pytest.param(
+            {
+                "type": "response.failed",
+                "response": {
+                    "status": "failed",
+                    "error": {
+                        "code": "server_error",
+                        "message": "Dots did not reply before the metadata deadline.",
+                    },
+                    "metadata": {
+                        "dots_bridge_error_code": "bridge_reply_timeout",
+                        "dots_bridge_request_id": "req_ws_metadata",
+                    },
+                },
+            },
+            [
+                "code=bridge_reply_timeout",
+                "request_id=req_ws_metadata",
+                "Dots did not reply before the metadata deadline.",
+            ],
+            id="sdk-compatible-server-error-with-bridge-cause",
+        ),
+        (
+            {
+                "type": "response.incomplete",
+                "response": {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "metadata": {"dots_bridge_request_id": "req_ws_incomplete"},
+                },
+            },
+            ["max_output_tokens", "req_ws_incomplete"],
+        ),
+        (
+            {
+                "type": "error",
+                "status": 400,
+                "error": {
+                    "code": "invalid_request_error",
+                    "message": "Only text input is supported.",
+                    "request_id": "req_ws_error",
+                },
+            },
+            ["invalid_request_error", "Only text input is supported.", "req_ws_error"],
+        ),
+    ],
+)
+async def test_websocket_failure_diagnostics_keep_structured_cause_and_request_id(
+    event, expected, capsys
+):
+    connection = FakeConnection(event_overrides={"失敗": [event]})
+    client = FakeClient(connection=connection)
+    async with asyncio.timeout(1):
+        await example.run_chat(client, ScriptedSession("失敗", "次", "/exit"), mode="websocket")
+    output = capsys.readouterr().out
+    for value in expected:
+        assert value in output
+    assert "dots> 返信: 次" in output
+    assert [request["input"] for request in connection.requests] == ["失敗", "次"]
+
+
+async def test_websocket_request_timeout_is_configurable_and_does_not_resend():
+    connection = FakeConnection(auto_reply=False)
+    client = FakeClient(connection=connection)
+    async with asyncio.timeout(1):
+        with pytest.raises(TimeoutError):
+            await example.run_chat(
+                client, ScriptedSession("pending"), mode="websocket", timeout=0.01
+            )
+    assert len(connection.requests) == 1
+    assert connection.closed
+    assert connection.active_receivers == 0
+
+
+def test_parser_accepts_longer_client_timeout_for_long_running_dots():
+    assert example.parser().parse_args(["--timeout", "660"]).timeout == 660
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])
+def test_parser_rejects_unbounded_or_nonpositive_client_timeout(value):
+    with pytest.raises(SystemExit) as error:
+        example.parser().parse_args(["--timeout", value])
+    assert error.value.code == 2
 
 
 async def test_websocket_subscription_failure_stops_before_initial_send_and_prompt():
