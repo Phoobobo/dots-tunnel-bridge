@@ -772,8 +772,9 @@ async def test_websocket_request_timeout_is_configurable_and_does_not_resend():
     assert connection.active_receivers == 0
 
 
-def test_parser_accepts_longer_client_timeout_for_long_running_dots():
-    assert example.parser().parse_args(["--timeout", "660"]).timeout == 660
+def test_parser_defaults_to_long_running_client_timeout_and_allows_override():
+    assert example.parser().parse_args([]).timeout == 660
+    assert example.parser().parse_args(["--timeout", "900"]).timeout == 900
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "nan", "inf"])

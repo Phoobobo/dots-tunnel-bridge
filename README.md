@@ -370,12 +370,13 @@ dots-bridge connector openai --config /path/to/bridge.toml \
 ```
 
 同じbridge channelに複数のsubscriptionがある場合は`--subscription-id`も指定してください。
+`--reply-timeout`の既定は600秒です。調査などで最終回答まで数分かかる場合も待機します。
 呼び出し側のタイムアウトは`--reply-timeout`より長く設定してください。
 CLI起動時は`dots_bridge.connectors.openai`のINFOログに依頼の受付、途中結果、最終回答を記録し、エラーはWARNINGで記録します。
 `request_id`で同じ依頼を追跡でき、`elapsed`は処理の経過秒数、`reply_timeout`は設定した待機秒数です。本文・認証情報・接続先URLは記録しません。
 
 ```text
-event=request_error protocol=chat.completions.stream request_id=req_... code=bridge_reply_timeout elapsed=120.006s reply_timeout=120.000s error_type=ReplyTimeoutError
+event=request_error protocol=chat.completions.stream request_id=req_... code=bridge_reply_timeout elapsed=600.006s reply_timeout=600.000s error_type=ReplyTimeoutError
 ```
 
 `bridge_reply_timeout`は最終返信の待機期限に達したことを示します。上流との通信障害は`bridge_unavailable`となり、`error_type=ReadTimeout`などで通信側のタイムアウトを判別できます。
@@ -407,7 +408,7 @@ settings = Settings.from_file("bridge.toml")
 with OpenAI(
     base_url="http://127.0.0.1:8766/v1",
     api_key=settings.api_key,
-    timeout=180,
+    timeout=660,
     max_retries=0,
 ) as client:
     result = client.chat.completions.create(
@@ -500,9 +501,10 @@ python examples/openai_client.py --mode websocket
 
 エラー時は原因コード、メッセージ、要求ID、経過秒を表示します。
 SSEの途中で失敗した場合も`bridge_reply_timeout`などの原因を確認できます。
-コネクターの返信待ちは既定120秒で、途中結果が届いても延長しません。
-長めの調査を試す場合は、コネクターを停止して待機時間を延長して起動し、
-クライアント側の`--timeout`もそれより長く指定します。以下はそれぞれ別ターミナルで実行します。
+コネクターの返信待ちは既定600秒で、途中結果が届いても延長しません。
+このサンプルのクライアント側タイムアウトは既定660秒です。
+待機時間を変更する場合はコネクターを再起動し、クライアント側の`--timeout`もそれより長く指定します。
+既定値を明示する場合は、以下をそれぞれ別ターミナルで実行します。
 
 ```sh
 dots-bridge connector openai --reply-timeout 600

@@ -156,9 +156,7 @@ def connector_server(monkeypatch):
 
     module.create_openai_connector = create_connector
     monkeypatch.setitem(sys.modules, "dots_bridge.connectors.openai", module)
-    monkeypatch.setattr(
-        uvicorn, "run", lambda app, **kwargs: seen.append(("run", app, kwargs))
-    )
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: seen.append(("run", app, kwargs)))
     return sentinel, seen
 
 
@@ -173,7 +171,7 @@ def test_openai_connector_defaults_are_separate_from_bridge_server(config, conne
                 "api_key": Settings.from_file(config).api_key,
                 "channel": "default",
                 "subscription_id": None,
-                "reply_timeout": 120.0,
+                "reply_timeout": 600.0,
             },
         ),
         (
@@ -204,11 +202,16 @@ def test_openai_connector_passes_explicit_arguments(config, connector_server, op
     if option_position == "openai":
         arguments += connection_arguments
     arguments += [
-        "--host", "0.0.0.0",
-        "--port", "9001",
-        "--channel", "chat",
-        "--subscription-id", "sub_test",
-        "--reply-timeout", "17.5",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "9001",
+        "--channel",
+        "chat",
+        "--subscription-id",
+        "sub_test",
+        "--reply-timeout",
+        "17.5",
     ]
     assert cli.main(arguments) == 0
     assert seen == [

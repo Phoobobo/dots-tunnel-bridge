@@ -36,7 +36,7 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--url", default="http://127.0.0.1:8766/v1")
     command.add_argument("--mode", choices=["chat", "stream", "websocket"], default="chat")
     command.add_argument(
-        "--timeout", type=_timeout, default=180.0, help="Client timeout seconds (default: 180)"
+        "--timeout", type=_timeout, default=660.0, help="Client timeout seconds (default: 660)"
     )
     command.add_argument(
         "--consumer-id",
@@ -300,7 +300,7 @@ async def run_chat(
     mode="chat",
     initial_text=None,
     consumer_id="example-openai",
-    timeout=180,  # noqa: ASYNC109 - Forwarded to the WebSocket turn deadline.
+    timeout=660,  # noqa: ASYNC109 - Forwarded to the WebSocket turn deadline.
 ):
     print("Enterで送信、/exit・/quit・Ctrl+C・Ctrl+Dで終了します。", flush=True)
     if mode == "websocket":

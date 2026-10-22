@@ -265,7 +265,7 @@ def create_openai_connector(
     api_key: str,
     channel: str = "default",
     subscription_id: str | None = None,
-    reply_timeout: float = 120,
+    reply_timeout: float = 600,
     model: str = "dots",
     client: AsyncBridgeClient | None = None,
 ) -> Starlette:

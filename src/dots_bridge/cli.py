@@ -68,7 +68,7 @@ def _parser() -> argparse.ArgumentParser:
     openai.add_argument("--channel", default="default")
     openai.add_argument("--subscription-id")
     openai.add_argument(
-        "--reply-timeout", type=_number, default=120.0, help="Reply wait seconds (default: 120)"
+        "--reply-timeout", type=_number, default=600.0, help="Reply wait seconds (default: 600)"
     )
     command("subscriptions", "List active dots subscriptions", remote=True)
     send = command("send", "Queue a message for dots", remote=True)
