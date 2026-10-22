@@ -174,8 +174,11 @@ python examples/chat.py --url http://127.0.0.1:9000 --config /path/to/bridge.tom
 ```
 
 同じchannelに複数のdotsが購読している場合は、`--subscription-id`で送信先を選びます。
-既定consumer IDは`example-chat`です。初回はそのchannelの保存済み受信も表示し、
-次回からは保存済みの処理位置から再開します。channelを変更する場合は別のconsumer IDを指定してください。
+既定consumer IDは`example-app`で、`send_message.py`と共通です。
+一方を終了してからもう一方を起動すると、同じ処理位置を引き継ぎ、処理済みの受信は再表示しません。
+両方を同時に動かす場合は、チャットの`--consumer-id`に別のIDを指定してください。
+受信の処理位置はIDごとに独立しているため、新しいIDでは保存済みの受信も先頭から表示します。
+channelを変更する場合も別のconsumer IDを指定してください。
 このサンプルの端末入力には[prompt_toolkit](https://python-prompt-toolkit.readthedocs.io/en/master/pages/asking_for_input.html#prompt-in-an-asyncio-application)を使用しています。
 
 ## 受信時にコールバックを実行する

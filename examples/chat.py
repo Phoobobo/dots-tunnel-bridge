@@ -23,7 +23,11 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument(
         "--subscription-id", help="Select a dot when several subscribe to a channel"
     )
-    command.add_argument("--consumer-id", default="example-chat")
+    command.add_argument(
+        "--consumer-id",
+        default="example-app",
+        help="Receive checkpoint ID (shared with send_message.py by default)",
+    )
     return command
 
 
@@ -68,14 +72,14 @@ async def run_chat(
     *,
     channel="default",
     subscription_id=None,
-    consumer_id="example-chat",
+    consumer_id="example-app",
 ):
     @bridge.on_received
     async def received(message: ReceivedMessage):
         print(f"dots> {message.text}", flush=True)
 
     print("Enterで送信、/exit・Ctrl+C・Ctrl+Dで終了します。", flush=True)
-    print("保存済みの未処理メッセージも受信します。", flush=True)
+    print("このアプリで未処理のメッセージから再開します。", flush=True)
     await bridge.start_receiving(consumer_id=consumer_id, channel=channel)
     tasks = [
         asyncio.create_task(

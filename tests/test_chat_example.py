@@ -8,8 +8,9 @@ from pathlib import Path
 
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 
-from dots_bridge import BridgeError, ReceivedMessage
+from dots_bridge import BridgeError, DotsBridge, ReceivedMessage, Settings
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "examples" / "chat.py"
 spec = importlib.util.spec_from_file_location("dots_bridge_chat_example", EXAMPLE)
@@ -120,6 +121,45 @@ async def test_chat_handles_multiple_sends_and_replies_in_one_process(capsys):
     assert "dots> 返信: もう少し教えて" in output
     assert bridge.stop_count == 1
     assert not bridge.receiving
+
+
+async def test_chat_continues_send_example_checkpoint_without_replaying_processed_messages(
+    tmp_path,
+    capsys,
+):
+    settings = Settings(
+        owner_key="owner-" + "a" * 32,
+        api_key="app-" + "b" * 32,
+        storage_key=Fernet.generate_key().decode(),
+        db_path=tmp_path / "bridge.sqlite3",
+    )
+    bridge = DotsBridge(settings)
+    previous = await bridge.send_to_app("送信テストで処理済み", idempotency_key="old")
+    # This persisted checkpoint was written by the send_message.py demo.
+    await bridge.acknowledge_received("example-app", previous["sequence"], channel="default")
+    options = chat.parser().parse_args([])
+    new_message = None
+
+    class Session:
+        async def prompt_async(self, prompt):
+            nonlocal new_message
+            new_message = await bridge.send_to_app("チャットで新規受信", idempotency_key="new")
+            async with asyncio.timeout(1):
+                # Observe successful callback acknowledgement in the real SQLite store.
+                while True:  # noqa: ASYNC110 - Wait for the durable receive cursor.
+                    cursor = await bridge.get_consumer_cursor(options.consumer_id, "default")
+                    if cursor >= new_message["sequence"]:
+                        return "/exit"
+                    await asyncio.sleep(0.005)
+
+    try:
+        await chat.run_chat(bridge, Session(), consumer_id=options.consumer_id)
+        output = capsys.readouterr().out
+        assert "dots> 送信テストで処理済み" not in output
+        assert "dots> チャットで新規受信" in output
+        assert await bridge.get_consumer_cursor("example-app", "default") == new_message["sequence"]
+    finally:
+        await bridge.close()
 
 
 async def test_push_preserves_partially_typed_prompt_and_next_submission(terminal, capsys):
