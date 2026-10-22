@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "dots-bridge"
 version = "0.6.0"
-description = "An HTTP and MCP Events bridge between external applications and OpenAI dots"
+description = "Use OpenAI dots from your own apps: a bridge with a Python client and an OpenAI-compatible API."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
