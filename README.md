@@ -139,6 +139,45 @@ dots-bridge send "接続テストです。受信したと返信してくださ�
 同じchannelに複数の購読がある場合は、送信時の`subscription_id`を必須にしています。
 購読を解除するには、対象dotsに`app.message.created`の購読解除を依頼します。
 
+## ターミナルでチャットする
+
+サーバーとngrokを起動したまま、チャット用のサンプルを実行できます。
+
+```sh
+python -m pip install -e '.[chat]'
+python examples/chat.py
+```
+
+```text
+user> こんにちは
+dots> こんにちは！何かお手伝いできることはありますか？
+user> 今日の予定を一緒に考えよう
+dots> もちろんです。今日は何をする予定ですか？
+user>
+```
+
+Enterで送信し、何度でもやり取りできます。入力中も`on_received`で返信・自発メッセージを受け取り、
+`dots>`に表示します。返信を待たず次の入力を始めても、入力中の文字を保ってプロンプトを描き直します。
+`/exit`、`/quit`、Ctrl+C、Ctrl+Dで終了します。サーバーとngrokはそのまま継続します。
+
+設定ファイルの既定値はリポジトリー直下の`bridge.toml`なので、ほかのディレクトリーからも実行できます。
+
+```sh
+python /Users/uezo/dev/dots-bridge/examples/chat.py
+```
+
+別のchannelやサーバーを使う場合は、引数で指定できます。
+
+```sh
+python examples/chat.py --channel work --consumer-id chat-work
+python examples/chat.py --url http://127.0.0.1:9000 --config /path/to/bridge.toml
+```
+
+同じchannelに複数のdotsが購読している場合は、`--subscription-id`で送信先を選びます。
+既定consumer IDは`example-chat`です。初回はそのchannelの保存済み受信も表示し、
+次回からは保存済みの処理位置から再開します。channelを変更する場合は別のconsumer IDを指定してください。
+このサンプルの端末入力には[prompt_toolkit](https://python-prompt-toolkit.readthedocs.io/en/master/pages/asking_for_input.html#prompt-in-an-asyncio-application)を使用しています。
+
 ## 受信時にコールバックを実行する
 
 別プロセスのアプリでは`AsyncBridgeClient`にハンドラーを登録し、`start_receiving()`で受信を開始します。

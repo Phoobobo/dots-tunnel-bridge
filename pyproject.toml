@@ -27,7 +27,8 @@ classifiers = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8", "pytest-asyncio>=1", "ruff>=0.12", "build>=1.2"]
+chat = ["prompt-toolkit>=3.0.43,<4"]
+dev = ["pytest>=8", "pytest-asyncio>=1", "ruff>=0.12", "build>=1.2", "prompt-toolkit>=3.0.43,<4"]
 
 [project.scripts]
 dots-bridge = "dots_bridge.cli:main"
