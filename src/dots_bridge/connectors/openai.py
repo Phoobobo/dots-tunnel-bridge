@@ -38,6 +38,7 @@ from ._openai_protocol import (
     response_object,
     response_start_events,
 )
+from ._websocket_push import WebSocketPushSession
 
 MAX_REQUEST_BYTES = 300 * 1024
 MAX_QUEUED_RESPONSES = 16
@@ -208,8 +209,8 @@ def create_openai_connector(
     """Create a separately served OpenAI-compatible bridge client.
 
     ``api_key`` authenticates this connector and its upstream bridge requests.
-    A supplied client remains owned by its caller. The connector reads replies
-    by request ID and does not advance any received-message consumer cursor.
+    A supplied client remains owned by its caller. Replies are read by request
+    ID. Opt-in WebSocket push uses a separate, explicitly acknowledged consumer.
     """
     if not isinstance(api_key, str) or not api_key.strip():
         raise ValueError("api_key must be a nonempty string")
@@ -222,6 +223,7 @@ def create_openai_connector(
     MessageInput(text="validate", channel=channel, subscription_id=subscription_id)
     _model({"model": model}, "dots")
     bridge_client = client if client is not None else AsyncBridgeClient(bridge_url, api_key=api_key)
+    push_consumers: set[str] = set()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -357,6 +359,13 @@ def create_openai_connector(
             async with send_lock:
                 await socket.send_text(_json(event))
 
+        push_session = WebSocketPushSession(
+            bridge_client,
+            channel=channel,
+            send_event=send_event,
+            consumer_registry=push_consumers,
+        )
+
         async def run_response(payload):
             requested_model = _model(payload, model)
             response_id = "resp_" + uuid.uuid4().hex
@@ -418,9 +427,18 @@ def create_openai_connector(
                     if message.get("text") is None:
                         raise ProtocolError("Send JSON as a text WebSocket message.")
                     payload = _parse_json(message["text"])
-                    if payload.get("type") != "response.create":
+                    event_type = payload.get("type")
+                    if event_type == "dots.subscribe":
+                        await push_session.subscribe(payload.get("consumer_id"))
+                        continue
+                    if event_type == "dots.push.ack":
+                        await push_session.acknowledge(payload.get("message_id"))
+                        continue
+                    if event_type != "response.create":
                         raise ProtocolError(
-                            "Only response.create events are supported.", param="type"
+                            "Supported events are response.create, dots.subscribe, "
+                            "and dots.push.ack.",
+                            param="type",
                         )
                     _options(payload, websocket=True)
                     _model(payload, model)
@@ -443,7 +461,7 @@ def create_openai_connector(
                             status_code=429,
                             code="rate_limit_exceeded",
                         ) from None
-                except ProtocolError as error:
+                except (ProtocolError, BridgeError, httpx.HTTPError) as error:
                     status, body = _error(error)
                     event = {"type": "error", "status": status, **body}
                     if isinstance(payload, dict):
@@ -464,6 +482,7 @@ def create_openai_connector(
             for task in tasks:
                 task.cancel()
             with CancelScope(shield=True):
+                await push_session.close()
                 await asyncio.gather(*tasks, return_exceptions=True)
 
     async def protocol_error(request, error):

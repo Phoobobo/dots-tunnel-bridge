@@ -45,7 +45,7 @@ wheelも作成できます。PyPIへの公開は別途行う作業です。
 ```sh
 python -m pip install build
 python -m build
-python -m pip install dist/dots_bridge-0.3.0-py3-none-any.whl
+python -m pip install dist/dots_bridge-0.4.0-py3-none-any.whl
 ```
 
 ## サーバーの起動
@@ -331,13 +331,14 @@ dots-bridge openai --config bridge.toml \
 
 同じbridge channelに複数のsubscriptionがある場合は`--subscription-id`も指定してください。
 呼び出し側のタイムアウトは`--reply-timeout`より長く設定してください。
-コネクターには追加DBやconsumer IDが不要です。返信を`request_id`で照合し、受信カーソルを進めないため、既存の`on_received`と併用できます。
+コネクターには追加DBが不要です。通常の返信は`request_id`で照合し、受信カーソルを進めません。
+自発pushを購読する場合だけ専用の`consumer_id`を指定します。既存の`on_received`とは処理位置を分けて併用できます。
 
 | 入口 | 対応内容 |
 | --- | --- |
 | `POST /v1/chat/completions` | Chat Completions形式のJSON応答、`stream: true`でSSE |
 | `GET /v1/models` | モデル名`dots`を返す一覧 |
-| `WS /v1/responses` | `response.create`を受け付け、Responses形式のイベントを返す |
+| `WS /v1/responses` | Responses形式の要求・返信と、明示的に購読した自発push |
 | `GET /health` | コネクター自身の生存確認。bridgeへの接続確認ではない |
 
 ### Chat Completionsから呼び出す
@@ -414,13 +415,81 @@ python examples/openai_client.py --mode stream "こんにちは"
 python examples/openai_client.py --mode websocket "こんにちは"
 ```
 
+### WebSocketで自発pushも受信する
+
+自発pushは`dots.push`イベントで通知します。通常の返信の`response.*`系列とは別で、返信を待っている間にも受信できます。
+**`type: "dots.push"`と`message.kind: "push"`で識別し、`message.request_id`は`null`になります。**
+`message.id`は受信メッセージ自身のIDで、再配信時も変わりません。
+
+WebSocket接続後、次のJSONで購読を開始してください。`response.create`を送らなくてもpushを受信できます。
+
+```json
+{"type":"dots.subscribe","consumer_id":"personal-agent"}
+```
+
+購読成功時は`dots.subscribed`が返り、その後からpushが届きます。
+
+```json
+{
+  "type": "dots.push",
+  "consumer_id": "personal-agent",
+  "message": {
+    "id": "received-message-id",
+    "sequence": 123,
+    "kind": "push",
+    "request_id": null,
+    "channel": "default",
+    "text": "依頼されていた件について、新しい情報がありました。",
+    "metadata": {},
+    "received_at": "2026-10-22T03:00:00Z"
+  }
+}
+```
+
+パーソナルエージェントの共通文脈への取り込みなど、必要な処理が成功してからACKを返します。
+
+```json
+{"type":"dots.push.ack","message_id":"received-message-id"}
+```
+
+bridgeに処理済み位置を保存できると`dots.push.acked`を返し、次のpushへ進みます。
+一度に未ACKのpushは1件だけです。ACKが失敗した場合は`error`が返り、同じ`message_id`で再ACKできます。
+直前に成功したACKの再送は、同じ接続内では処理済み確認として扱います。
+
+| イベント | 向き | 内容 |
+| --- | --- | --- |
+| `dots.subscribe` | 利用側→コネクター | `consumer_id`を指定してpushを購読 |
+| `dots.subscribed` | コネクター→利用側 | 購読したconsumer、channel、現在のcursor |
+| `dots.push` | コネクター→利用側 | 自発メッセージ。`message`は既存の`ReceivedMessage`と同じ形式 |
+| `dots.push.ack` | 利用側→コネクター | 処理したpushの`message_id`を指定 |
+| `dots.push.acked` | コネクター→利用側 | 保存できた`message_id`と`sequence`を確認 |
+
+この`dots.*`系列は**dots-bridge独自の拡張**です。購読しない接続には送らないため、従来のResponsesクライアントもそのまま使えます。
+pushを扱う場合は、下のサンプルのように生のWebSocketでJSONを読む方法を推奨します。
+公式SDKで扱う場合も、`recv_bytes()`からJSONを読み、独自イベントを処理してください。標準イベントの型への変換は`response.*`等だけに行い、同じsocketで複数の受信ループを動かさないでください。
+
+```sh
+python examples/websocket_push.py --consumer-id personal-agent
+# 同じsocketで依頼の返信とpushを受け取る場合
+python examples/websocket_push.py --consumer-id personal-agent --message "こんにちは"
+```
+
+サンプルは表示後にACKし、接続を維持します。実際のアプリでは、永続的な取り込みが成功してからACKしてください。
+切断後は同じ`consumer_id`で接続・購読し直すと未ACK分を再配信します。処理後にACKが届かず切断した場合は再配信され得るので、外部への副作用は`message.id`で重複を防ぎます。
+
+`consumer_id`はLINE・電話などの会話チャネルごとではなく、受信するパーソナルエージェントに対して固定してください。
+別のIDで購読すると保存済みのpushを先頭から別途受信します。英数字と`_ . : -`の1〜118文字が使え、bridge内部のconsumerは`openai-ws:<consumer_id>`です。
+channelはコネクター起動時の`--channel`に固定されます。同じconsumerでchannelを変更しないでください。
+同じコネクタープロセス内では、同じconsumerの同時購読は409で拒否します。別プロセスのコネクター同士でも同じconsumerを同時に使わないでください。
+このpush専用consumerでは通常の返信を読み飛ばしてACKします。他のconsumerの処理位置には影響しません。
+
 ### 互換範囲
 
 - テキスト会話の入出力に対応します。Chatの`messages`、Responsesの配列形式`input`では、**最新の`role: user`の1件だけ**を転送します。文字列の`input`はそのまま転送します。
 - 過去の履歴、system/developerメッセージ、`instructions`、`previous_response_id`、入力側の`response_id`は転送・復元しません。会話の文脈はdots側で継続します。
 - `model`は互換クライアント用の名前です。別名でも同じdotsへ届き、モデルを切り替えません。temperatureやトークン上限などの生成設定は無視します。
 - 画像・音声・ファイル、クライアント指定のtools、構造化出力、複数候補、warmup、steering、ResponsesのHTTP APIや保存済み応答の取得は未対応です。最新のメッセージが非テキストや空の場合はエラーにし、古い依頼を代わりに送信しません。
-- WebSocketは`response.create`に対する返信を扱います。dotsからの自発pushは既存の`on_received`で受信してください。コネクターはpushを返信として扱わず、処理済みにもしません。
+- WebSocketは`response.create`に対する返信に加え、独自の`dots.subscribe`による自発push購読に対応します。pushはResponsesの完了イベントに混ぜず、利用側からの明示ACKで処理済みにします。
 - 接続が切れたり待機がタイムアウトしても、送信済みのdotsへの依頼は継続します。HTTP応答の`X-Dots-Request-ID`、エラー内の`request_id`、WS完了・失敗応答の`metadata.dots_bridge_request_id`で状態を調べられます。
 - コネクターは依頼を自動再送しません。HTTPエラーでは公式SDK向けに`x-should-retry: false`を返します。切断後も再送を避けたい場合は呼び出し側で自動再試行を無効にし、HTTPでは同じ`Idempotency-Key`ヘッダーを付けて再実行できます（128文字以内）。
 - 入力全体は300 KiB、転送する最新のテキストは16,000文字までです。WSは処理中の1件に加え16件まで待機できます。ブラウザーからの異なるoriginへのアクセスは許可しません。
