@@ -180,6 +180,21 @@ async def test_push_requires_manual_ack_before_any_later_receipt_is_consumed():
         assert api.cursors == {(CONSUMER, CHANNEL): 3}
 
 
+async def test_request_progress_is_skipped_by_push_consumer_without_becoming_a_push():
+    progress = {**receipt(1, kind="progress"), "request_id": "req_work"}
+    api = ReceiptAPI([progress, receipt(2)])
+    async with push_session(api) as (session, sink, _, _):
+        await subscribe(session, sink)
+        pushed = await sink.next()
+        assert pushed["type"] == "dots.push"
+        assert pushed["message"]["sequence"] == 2
+        assert pushed["message"]["request_id"] is None
+        assert api.cursors[(CONSUMER, CHANNEL)] == 1
+        await session.acknowledge(pushed["message"]["id"])
+        assert (await sink.next())["type"] == "dots.push.acked"
+        assert api.cursors[(CONSUMER, CHANNEL)] == 2
+
+
 async def test_reply_receipts_are_skipped_using_only_the_push_consumers_cursor():
     api = ReceiptAPI(
         [receipt(1, kind="reply"), receipt(2, channel="elsewhere"), receipt(3, kind="reply")]

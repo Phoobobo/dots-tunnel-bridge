@@ -15,11 +15,13 @@ sequenceDiagram
     Bridge-->>App: 202 + request_id
     Bridge->>Dot: MCP Events HTTPS Webhook
     Dot-->>Bridge: HTTP受付（処理は非同期）
+    Dot->>Bridge: report_progress(request_id, text, idempotency_key)
+    Bridge->>Bridge: 途中結果をSQLiteへ保存
     Dot->>Bridge: reply_to_app(request_id, text)
     Bridge->>Bridge: 返信をSQLiteへ保存
     Dot->>Bridge: send_to_app(text, idempotency_key)（自発メッセージ）
     App->>Bridge: GET /api/received（バックグラウンド）
-    Bridge-->>App: 未処理の返信・自発メッセージ
+    Bridge-->>App: 未処理の途中結果・最終返信・自発メッセージ
     App->>App: on_received(message)
     App->>Bridge: 成功した処理位置をACK
 ```
@@ -45,7 +47,7 @@ wheelも作成できます。PyPIへの公開は別途行う作業です。
 ```sh
 python -m pip install build
 python -m build
-python -m pip install dist/dots_bridge-0.4.0-py3-none-any.whl
+python -m pip install dist/dots_bridge-0.5.0-py3-none-any.whl
 ```
 
 ## サーバーの起動
@@ -77,7 +79,7 @@ ngrok http 8765 --url https://YOUR-DOMAIN.ngrok.app
 | `db_path` | SQLiteファイル。設定ファイルからの相対パス。初期値は`data/bridge.sqlite3` |
 | `host` / `port` | 待受先。初期値は`127.0.0.1:8765` |
 | `subscription_ttl_seconds` | 購読の上限・既定寿命。初期値86400秒 |
-| `reply_timeout_seconds` | 依頼を作成してから返信を受け付ける期間。初期値3600秒 |
+| `reply_timeout_seconds` | 依頼を作成してから途中結果・最終返信を受け付ける期間。初期値3600秒 |
 | `max_delivery_attempts` | Webhook配送の最大試行回数。初期値5回 |
 | `retry_base_seconds` | 指数バックオフの基準秒数。初期値1秒 |
 | `worker_interval_seconds` | 配送キュー確認の最大待ち間隔。初期値0.5秒 |
@@ -92,7 +94,7 @@ ngrok http 8765 --url https://YOUR-DOMAIN.ngrok.app
 2. MCP URLを`https://YOUR-DOMAIN.ngrok.app/mcp`、認証をOAuthにします。
 3. 登録画面に表示された**正確な**callback URLを、`bridge.toml`の`redirect_uri`に設定してサーバーを再起動します。
 4. 下表の値で登録・接続し、同意画面には`owner_key`を入力します。
-5. 公開一覧に`app.message.created`、`get_current_user`、`get_message`、`reply_to_app`、`send_to_app`が表示されることを確認します。変更後はツール・イベントを再スキャンします。
+5. 公開一覧に`app.message.created`、`get_current_user`、`get_message`、`report_progress`、`reply_to_app`、`send_to_app`が表示されることを確認します。変更後はツール・イベントを再スキャンします。
 
 | 登録項目 | 値 |
 | --- | --- |
@@ -116,6 +118,8 @@ callback URLとWebhook secretは、購読時にdots側からサーバーへ渡�
 > dots-bridgeのget_current_userで接続を確認してください。
 > app.message.createdをchannel="default"で購読してください。
 > この接続は私のアプリです。届いたdata.textを私からの依頼として処理し、
+> 途中結果を伝える場合は、同じdata.request_idと通常の文章を使ってreport_progressを呼んでください。
+> idempotency_keyは途中結果ごとに一意にし、同じ途中結果の再試行では同じ値を使ってください。
 > 最終回答は必ずdata.request_idと回答本文を使ってreply_to_appへ返してください。
 > 通常確認が必要な操作は、この経路でも確認してください。
 > 購読できたか、その結果も教えてください。
@@ -125,9 +129,19 @@ dotsから依頼に紐づかないメッセージも送ってほしい場合は�
 > 私が依頼した通知をアプリへ届ける場合は、send_to_appをchannel="default"で呼んでください。
 > idempotency_keyには通知ごとに一意な値を使い、同じ通知を再試行する場合は同じ値を使ってください。
 
-返信には`reply_to_app(request_id, text)`、自発メッセージには`send_to_app(text, idempotency_key, ...)`を使います。
+| ツール | 用途 |
+| --- | --- |
+| `report_progress(request_id, text, idempotency_key)` | 依頼に紐づく途中結果。依頼は未完了のまま |
+| `reply_to_app(request_id, text)` | 依頼の最終回答。依頼ごとに1件 |
+| `send_to_app(text, idempotency_key, ...)` | 依頼に紐づかない自発メッセージ |
+
+MCPツールの呼び出し引数はJSONですが、`text`本文は普通の文字列です。
+dotsに構造化JSONの回答本文を作らせる必要はありません。途中結果も最終回答も、そのままの文章を渡します。
 `send_to_app`は先行する依頼やイベント購読を必要としません。OAuth接続と`messages:reply`権限が必要です。
 dots側の画面や会話の文章が自動転送されるわけではなく、これらのツールを呼んだ内容がアプリへ届きます。
+
+既存の接続で途中結果に対応する場合は、更新後のbridgeとコネクターを両方再起動し、MCPツールを再スキャンしてください。
+そのうえで、上の`report_progress`を含む指示をdotsへ伝え直します。
 
 プラグインの接続とイベント購読は別の手順です。購読は`subscriptions`で確認できます。
 
@@ -136,7 +150,7 @@ dots-bridge subscriptions --config bridge.toml
 dots-bridge send "接続テストです。受信したと返信してください。" --wait --timeout 120 --config bridge.toml
 ```
 
-複数のdotsを使う場合は、それぞれ異なる`channel`で購読し、送信時にも指定してください。
+用途を分ける場合は、異なる`channel`で購読し、送信時にも対応するchannelを指定してください。
 同じchannelに複数の購読がある場合は、送信時の`subscription_id`を必須にしています。
 購読を解除するには、対象dotsに`app.message.created`の購読解除を依頼します。
 
@@ -157,7 +171,7 @@ dots> もちろんです。今日は何をする予定ですか？
 user>
 ```
 
-Enterで送信し、何度でもやり取りできます。入力中も`on_received`で返信・自発メッセージを受け取り、
+Enterで送信し、何度でもやり取りできます。入力中も`on_received`で途中結果・最終返信・自発メッセージを受け取り、
 `dots>`に表示します。返信を待たず次の入力を始めても、入力中の文字を保ってプロンプトを描き直します。
 `/exit`、`/quit`、Ctrl+C、Ctrl+Dで終了します。サーバーとngrokはそのまま継続します。
 
@@ -174,7 +188,7 @@ python examples/chat.py --channel work --consumer-id chat-work
 python examples/chat.py --url http://127.0.0.1:9000 --config /path/to/bridge.toml
 ```
 
-同じchannelに複数のdotsが購読している場合は、`--subscription-id`で送信先を選びます。
+同じchannelに複数の購読がある場合は、`--subscription-id`で送信先を選びます。
 既定consumer IDは`example-app`で、`send_message.py`と共通です。
 一方を終了してからもう一方を起動すると、同じ処理位置を引き継ぎ、処理済みの受信は再表示しません。
 両方を同時に動かす場合は、チャットの`--consumer-id`に別のIDを指定してください。
@@ -220,10 +234,10 @@ asyncio.run(main())
 | 属性 | 内容 |
 | --- | --- |
 | `text` | dotsからの本文 |
-| `kind` | 依頼への返信なら`reply`、自発メッセージなら`push` |
-| `request_id` | 返信元の依頼ID。自発メッセージなら`None` |
+| `kind` | 途中結果なら`progress`、最終返信なら`reply`、自発メッセージなら`push` |
+| `request_id` | 途中結果・最終返信の依頼ID。自発メッセージなら`None` |
 | `channel` | 受信先のchannel |
-| `metadata` | 返信なら元の依頼のmetadata、自発メッセージならツールで指定したmetadata |
+| `metadata` | 途中結果・最終返信なら元の依頼のmetadata、自発メッセージならツールで指定したmetadata |
 | `id` | 受信メッセージの一意なID。再処理時も同じ値 |
 | `sequence` | 保存順に増加する受信番号 |
 | `received_at` | サーバーの受信日時（UTCのISO 8601） |
@@ -266,6 +280,7 @@ app = create_app(settings, bridge=bridge)
 ## 送信した依頼の返信を待つ
 
 外部アプリには`api_key`だけを渡します。サーバーと同じ設定ファイルを読む場合の例です。
+`ask()`と`wait_for_reply()`は途中結果を返さず、`reply_to_app`による最終回答を待ちます。
 
 ```python
 from dots_bridge import BridgeClient, ReplyTimeoutError, Settings
@@ -310,11 +325,33 @@ asyncio.run(main())
 クライアントの待機期限と、サーバーの`reply_timeout_seconds`は別の期限です。
 同期版はHTTPXの通信操作ごとのタイムアウトを併用します。通信中も含む厳密な待機時間制限が必要なら非同期版を利用してください。
 
+## 依頼の途中結果と最終回答を順に受け取る
+
+`report_progress`による途中結果は、同じ`request_id`に何件でも保存できます。
+途中結果ごとの`idempotency_key`は1〜128文字です。同じ依頼・キー・本文で再試行すると同じ受信を返し、本文を変えると409になります。
+最終回答の保存後は新しい途中結果を受け付けませんが、保存済み途中結果の同文再試行は成功します。
+
+`AsyncBridgeClient.iter_responses()`で途中結果から最終回答まで順に受け取れます。
+上の非同期クライアントのコンテキスト内で、次のように呼び出します。
+
+```python
+queued = await client.send_message("調査中の状況も知らせて、最後に結論を返してください。")
+async for message in client.iter_responses(queued["request_id"], timeout=120):
+    print(message.kind, message.text)
+```
+
+保存済みの途中結果も保存順に返し、`kind="reply"`で終了します。
+`timeout`は反復全体の固定期限で、途中結果が届いても延長しません。
+依頼の再送やconsumerのACKは行わず、`on_received`とも併用できます。
+一覧を自分で取得する場合は、同期・非同期クライアントの`list_response_messages(request_id, after=0, limit=100)`を使います。
+`after`に最後の`sequence`を指定すると、その続きから取得できます。
+
 ## OpenAI互換コネクター
 
 `dots-bridge serve`はbridge本体を起動します。
 `dots-bridge connector openai`は既存bridgeへHTTP接続するコネクターだけを別プロセスで起動します。
-MCPサーバーへのルート追加やDB更新は不要です。bridgeとngrokはそのまま動かし、別ターミナルで起動します。
+コネクター用のルートをMCPサーバーへ追加したり、別DBを用意したりする必要はありません。
+bridgeとngrokを動かした状態で、別ターミナルで起動します。
 
 ```sh
 dots-bridge connector openai
@@ -334,12 +371,12 @@ dots-bridge connector openai --config /path/to/bridge.toml \
 
 同じbridge channelに複数のsubscriptionがある場合は`--subscription-id`も指定してください。
 呼び出し側のタイムアウトは`--reply-timeout`より長く設定してください。
-コネクターには追加DBが不要です。通常の返信は`request_id`で照合し、受信カーソルを進めません。
+コネクターには追加DBが不要です。途中結果・最終返信は`request_id`で照合し、受信カーソルを進めません。
 自発pushを購読する場合だけ専用の`consumer_id`を指定します。既存の`on_received`とは処理位置を分けて併用できます。
 
 | 入口 | 対応内容 |
 | --- | --- |
-| `POST /v1/chat/completions` | Chat Completions形式のJSON応答、`stream: true`でSSE |
+| `POST /v1/chat/completions` | JSONは最終回答のみ、`stream: true`のSSEは途中結果と最終回答 |
 | `GET /v1/models` | モデル名`dots`を返す一覧 |
 | `WS /v1/responses` | Responses形式の要求・返信と、明示的に購読した自発push |
 | `GET /health` | コネクター自身の生存確認。bridgeへの接続確認ではない |
@@ -374,8 +411,25 @@ with OpenAI(
     print(result.choices[0].message.content)
 ```
 
-`stream=True`も使用できます。dotsの返信は完成後に届くため、assistant role、全文のcontent、終了の順で返します。
+`stream=False`の通常REST応答は最終回答だけを返します。
+`stream=True`では、最初にassistant role、続いて届いた途中結果と最終回答をそれぞれcontent chunkで返します。
+途中結果の本文末尾には`\n\n`を加えて区切り、`finish_reason: "stop"`は最終回答の後だけ、`[DONE]`は最後に送ります。
+これはツールへ渡された文章単位の配信で、dotsの生成トークンを逐次取得するものではありません。
 待機中はSSEのコメントを送り、トークン数・料金は取得できないためusageを推定しません。
+
+各content chunkには、dots-bridge独自の`dots_bridge`属性も付きます。
+`kind`で途中結果と最終回答を区別し、`message_id`と`sequence`で受信を識別できます。
+
+```json
+{
+  "dots_bridge": {
+    "kind": "progress",
+    "request_id": "req_...",
+    "message_id": "received-message-id",
+    "sequence": 123
+  }
+}
+```
 
 ### ResponsesのWebSocketから呼び出す
 
@@ -406,8 +460,17 @@ with client.responses.connect(max_retries=0) as connection:
 {"type":"response.create","model":"dots","input":"こんにちは"}
 ```
 
-`response.created`、`response.in_progress`の後、返信が届くとmessage/content/textの各イベントと`response.completed`を返します。
-応答IDはコネクターが発行し、各応答内で一貫させます。`stream_id`を指定すると各イベントに同じ値を返しますが、処理は1接続内でFIFOです。
+`response.created`、`response.in_progress`の後、途中結果・最終回答が届くたびに標準のmessage/content/textイベントを返します。
+1回の依頼は同じresponse IDを使い、各文章を別のoutput itemとして追加します。
+途中結果のitemは`phase="commentary"`、最終回答のitemは`phase="final_answer"`です。
+途中結果の`response.output_item.done`はそのitemの完了であり、依頼全体は完了しません。
+最終回答の後にだけ`response.completed`を1回返し、その`response.output`に途中結果と最終回答の全itemを含めます。
+失敗時の`response.failed`も、それまでに届いた途中結果を`response.output`へ保持します。
+
+上の受信例は途中結果も表示します。最終回答だけ必要な場合は、完了応答の`response.output`から
+`item.phase == "final_answer"`のmessageだけを選び、そのcontentを使ってください。
+途中結果の受信に`dots.subscribe`は不要です。
+`stream_id`を指定すると各イベントに同じ値を返しますが、処理は1接続内でFIFOです。
 異なるWebSocket接続とHTTPリクエストは並行して利用できます。
 
 実行できるサンプルもあります。
@@ -420,7 +483,7 @@ python examples/openai_client.py --mode websocket "こんにちは"
 
 ### WebSocketで自発pushも受信する
 
-自発pushは`dots.push`イベントで通知します。通常の返信の`response.*`系列とは別で、返信を待っている間にも受信できます。
+自発pushは`dots.push`イベントで通知します。途中結果・最終返信の`response.*`系列とは別で、返信を待っている間にも受信できます。
 **`type: "dots.push"`と`message.kind: "push"`で識別し、`message.request_id`は`null`になります。**
 `message.id`は受信メッセージ自身のIDで、再配信時も変わりません。
 
@@ -484,7 +547,8 @@ python examples/websocket_push.py --consumer-id personal-agent --message "こん
 別のIDで購読すると保存済みのpushを先頭から別途受信します。英数字と`_ . : -`の1〜118文字が使え、bridge内部のconsumerは`openai-ws:<consumer_id>`です。
 channelはコネクター起動時の`--channel`に固定されます。同じconsumerでchannelを変更しないでください。
 同じコネクタープロセス内では、同じconsumerの同時購読は409で拒否します。別プロセスのコネクター同士でも同じconsumerを同時に使わないでください。
-このpush専用consumerでは通常の返信を読み飛ばしてACKします。他のconsumerの処理位置には影響しません。
+このpush専用consumerでは、依頼に紐づく`progress`・`reply`を読み飛ばしてACKします。
+他のconsumerの処理位置には影響しません。
 
 ### 互換範囲
 
@@ -493,6 +557,7 @@ channelはコネクター起動時の`--channel`に固定されます。同じco
 - `model`は互換クライアント用の名前です。別名でも同じdotsへ届き、モデルを切り替えません。temperatureやトークン上限などの生成設定は無視します。
 - 画像・音声・ファイル、クライアント指定のtools、構造化出力、複数候補、warmup、steering、ResponsesのHTTP APIや保存済み応答の取得は未対応です。最新のメッセージが非テキストや空の場合はエラーにし、古い依頼を代わりに送信しません。
 - WebSocketは`response.create`に対する返信に加え、独自の`dots.subscribe`による自発push購読に対応します。pushはResponsesの完了イベントに混ぜず、利用側からの明示ACKで処理済みにします。
+- 通常RESTは最終回答のみ、SSEとResponses WebSocketは途中結果も返します。途中結果は完了扱いにせず、最終回答で依頼を閉じます。
 - 接続が切れたり待機がタイムアウトしても、送信済みのdotsへの依頼は継続します。HTTP応答の`X-Dots-Request-ID`、エラー内の`request_id`、WS完了・失敗応答の`metadata.dots_bridge_request_id`で状態を調べられます。
 - コネクターは依頼を自動再送しません。HTTPエラーでは公式SDK向けに`x-should-retry: false`を返します。切断後も再送を避けたい場合は呼び出し側で自動再試行を無効にし、HTTPでは同じ`Idempotency-Key`ヘッダーを付けて再実行できます（128文字以内）。
 - 入力全体は300 KiB、転送する最新のテキストは16,000文字までです。WSは処理中の1件に加え16件まで待機できます。ブラウザーからの異なるoriginへのアクセスは許可しません。
@@ -510,17 +575,20 @@ Pythonアプリから直接起動する場合は、`dots_bridge.connectors.creat
 | `GET /health` | 認証不要のプロセス稼働確認 |
 | `GET /api/subscriptions` | 有効な購読のID、channel、期限。callbackやsecretは返さない |
 | `POST /api/messages` | 依頼を保存して202を返す |
-| `GET /api/messages/{request_id}` | 配送状態と保存済みの返信を取得 |
+| `GET /api/messages/{request_id}` | 配送状態と保存済みの最終返信を取得 |
+| `GET /api/messages/{request_id}/responses?after=0&limit=100` | その依頼の途中結果・最終返信を保存順で取得 |
 | `DELETE /api/subscriptions/{subscription_id}` | 購読を解除し、未配送依頼をキャンセル |
-| `GET /api/received?after=0&limit=100&channel=default` | 返信・自発メッセージの受信一覧（channelは省略可能） |
+| `GET /api/received?after=0&limit=100&channel=default` | 途中結果・最終返信・自発メッセージの受信一覧（channelは省略可能） |
 | `GET /api/consumers/{consumer_id}?channel=default` | consumerの処理位置を取得・初期化 |
 | `POST /api/consumers/{consumer_id}/ack` | `{"sequence": 123, "channel": "default"}`で処理位置を進める |
 
-受信一覧の戻り値は`{"messages": [...]}`、consumer操作の戻り値は`{"cursor": 123}`です。
+受信一覧・依頼ごとの応答一覧の戻り値は`{"messages": [...]}`、consumer操作の戻り値は`{"cursor": 123}`です。
 `after`は指定番号よりあとの受信、`limit`は1〜100件です。
+依頼ごとの応答一覧は`progress`・`reply`だけを返し、依頼が存在しない場合は404です。
 通常はクライアントのバックグラウンド受信が一覧取得とACKを行います。
 手動で扱う場合は同期・非同期クライアントの`list_received()`、`get_consumer_cursor()`、`acknowledge_received()`を使えます。
 受信一覧の取得だけでは処理位置は進みません。
+依頼ごとの一覧取得には同期・非同期クライアントの`list_response_messages()`、最終回答までの逐次受信には非同期クライアントの`iter_responses()`も使えます。
 
 送信JSONは次の形です。`text`以外は省略可能です。
 
@@ -547,6 +615,7 @@ Pythonアプリから直接起動する場合は、`dots_bridge.connectors.creat
 
 **202は保存完了、`accepted`はdots側WebhookのHTTP受付を表します。**
 dotsの処理完了・回答生成を示すのは`reply_to_app`で返信が保存され、`reply_status`が`replied`になった段階です。
+`report_progress`を呼んでも`reply_status`は`pending`のままです。
 
 ## 既存ASGIアプリへの組み込み
 
@@ -570,8 +639,10 @@ OAuthのwell-knownと運用エンドポイントを公開originのルートか�
 ## 保存・再送・運用上の範囲
 
 - **単一所有者向けです。** 複数テナント・一般公開の本人確認基盤は提供しません。
-- 設定はTOML、購読、依頼、配送状態、返信・自発メッセージ、受信処理位置、OAuth状態はSQLiteに保存します。
+- 設定はTOML、購読、依頼、配送状態、途中結果・最終返信・自発メッセージ、受信処理位置、OAuth状態はSQLiteに保存します。
   OAuthアクセストークンは1時間、refresh tokenは30日です。再起動で接続状態を失いません。
+- 既存dots-bridgeのschema 1〜3は、次回bridge起動時に同一トランザクションでschema 4へ自動移行します。
+  保存済みの受信ID・sequence・consumerの処理位置を維持します。コネクターはDBを直接操作しません。
 - Webhookのcallback URLとsecretはFernetで暗号化します。本文・返信・metadataを含むDB全体の暗号化は行いません。
   DB・設定・バックアップは所有者のみ読める場所に置いてください。
 - callbackを署名付きチャレンジで検証し、Standard Webhooksで署名します。
@@ -580,16 +651,17 @@ OAuthのwell-knownと運用エンドポイントを公開originのルートか�
   410では購読を削除します。同じイベントIDと本文を維持し、試行ごとに署名を作り直します。
 - サーバー停止後の未配送は起動時に再開します。送信中に停止した場合は30秒のlease期限後に再開します。
   受付後に通信が切れた場合は重複配信し得ます。dots側の副作用にも冪等性を持たせてください。
-- 返信は依頼ごとに1つです。同じ本文の再呼び出しは成功し、違う本文の再返信は拒否します。
-  ストリーミング返信、途中経過の複数返信、dotsの会話ログの自動取得は提供しません。
+- 最終返信は依頼ごとに1つです。同じ本文の再呼び出しは成功し、違う本文の再返信は拒否します。
+  途中結果は`report_progress`で複数回保存でき、SSE/WSやアプリの受信処理へ順に渡します。
+  dotsの生成トークンの逐次取得や、会話ログの自動取得は提供しません。
 - 有効な購読に対して送信します。送信時に購読がなければ409です。
   解除・失効・明示的なOAuth取消後は未配送を止めます。既に開始したHTTP要求は取り消せません。
 - イベント履歴のMCP cursor replayは提供せず、`cursor: null`を返します。
   内部outboxの再送と、MCPの履歴再生は別の機能です。`ttlMs: null`でも有限の購読期限を返します。
-- このパッケージが保存するのは`reply_to_app`・`send_to_app`へ渡された本文です。
+- このパッケージが保存するのは`report_progress`・`reply_to_app`・`send_to_app`へ渡された本文です。
   dotsがツールを必ず呼ぶこと、即時に処理されることは保証できません。
   dotsへの依頼で返信・通知方法を明示してください。
-- 受信一覧とconsumerの処理位置は`prune`で削除しません。依頼を削除しても未処理の返信を受信できます。
+- 受信一覧とconsumerの処理位置は`prune`で削除しません。依頼を削除しても未処理の途中結果・最終返信を受信一覧から取得できます。
   長期運用時はDB容量も確認してください。
 
 明示的にOAuth接続と購読を全て取り消す場合:

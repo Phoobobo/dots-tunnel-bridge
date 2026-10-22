@@ -18,7 +18,7 @@ from .bridge import DotsBridge
 from .config import Settings
 from .errors import BridgeError
 from .mcp import create_mcp
-from .models import MessageInput, ReceivedAcknowledgement
+from .models import MessageInput, ReceivedAcknowledgement, ReceivedQuery
 
 MAX_REQUEST_BYTES = 300 * 1024
 
@@ -167,6 +167,23 @@ def create_app(
             )
         return query
 
+    async def response_messages(request: Request):
+        authorize(request)
+        query = query_parameters(request, {"after", "limit"})
+        try:
+            validated = ReceivedQuery(
+                after=int(query.get("after", 0)), limit=int(query.get("limit", 100))
+            )
+        except (ValueError, ValidationError):
+            raise BridgeError("invalid_received_query", "Invalid after or limit.", 422) from None
+        return JSONResponse(
+            {
+                "messages": await bridge.list_response_messages(
+                    request.path_params["request_id"], after=validated.after, limit=validated.limit
+                )
+            }
+        )
+
     async def received(request: Request):
         authorize(request)
         query = query_parameters(request, {"after", "limit", "channel"})
@@ -243,6 +260,7 @@ def create_app(
             Route("/api/subscriptions/{subscription_id}", delete_subscription, methods=["DELETE"]),
             Route("/api/messages", submit, methods=["POST"]),
             Route("/api/messages/{request_id}", get_message),
+            Route("/api/messages/{request_id}/responses", response_messages),
             Route("/api/received", received),
             Route("/api/consumers/{consumer_id}", consumer_cursor),
             Route("/api/consumers/{consumer_id}/ack", acknowledge, methods=["POST"]),

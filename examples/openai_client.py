@@ -36,8 +36,9 @@ def main():
                 for event in connection:
                     if event.type == "response.output_text.delta":
                         print(event.delta, end="", flush=True)
-                    elif event.type == "response.completed":
+                    elif event.type == "response.output_text.done":
                         print()
+                    elif event.type == "response.completed":
                         break
                     elif event.type in {"error", "response.failed", "response.incomplete"}:
                         raise RuntimeError(event.to_json())

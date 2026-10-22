@@ -32,14 +32,35 @@ class PushInput(MessageInput):
     idempotency_key: str = Field(min_length=1, max_length=128)
 
 
+class ProgressInput(BaseModel):
+    """One idempotent intermediate result for an unfinished request."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=200)
+    text: str = Field(min_length=1, max_length=64000)
+    idempotency_key: str = Field(min_length=1, max_length=128)
+
+    @field_validator("request_id", "text", "idempotency_key")
+    @classmethod
+    def nonempty_unicode(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must contain a non-whitespace character")
+        try:
+            value.encode("utf-8")
+        except UnicodeError:
+            raise ValueError("value must contain valid Unicode text") from None
+        return value
+
+
 class ReceivedMessage(BaseModel):
-    """One durable message received from dots, either a reply or a proactive push."""
+    """One durable final reply, intermediate result, or proactive message from dots."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
     sequence: int = Field(ge=1)
     id: str
-    kind: Literal["reply", "push"]
+    kind: Literal["reply", "progress", "push"]
     request_id: str | None
     channel: str
     text: str

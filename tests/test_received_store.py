@@ -213,7 +213,7 @@ async def test_migration_backfills_replies_once_in_deterministic_order(store, sc
         await store.run(
             lambda db: db.execute("SELECT value FROM bridge_meta WHERE key='schema'").fetchone()[0]
         )
-        == b"3"
+        == b"4"
     )
     store._ready = False
     await store.initialize()

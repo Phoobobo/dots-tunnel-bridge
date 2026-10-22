@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import math
 import time
-from typing import Any
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any, TypeVar
 from urllib.parse import quote
 
 import httpx
@@ -13,6 +14,8 @@ import httpx
 from .errors import BridgeError
 from .models import MessageInput, ReceivedMessage
 from .receiver import ReceivedDispatcher, ReceivedHandler, _cursor, _received
+
+_Result = TypeVar("_Result")
 
 
 class ReplyTimeoutError(TimeoutError):
@@ -96,6 +99,45 @@ def _subscriptions(body: dict[str, Any]) -> list[dict[str, Any]]:
     result = body.get("subscriptions")
     if not isinstance(result, list) or any(not isinstance(item, dict) for item in result):
         raise BridgeError("invalid_response", "Bridge returned an invalid subscription list.", 502)
+    return result
+
+
+def _response_messages(body: dict[str, Any], request_id: str) -> list[ReceivedMessage]:
+    messages = _received(body.get("messages"))
+    if any(
+        message.request_id != request_id or message.kind not in {"progress", "reply"}
+        for message in messages
+    ):
+        raise BridgeError(
+            "invalid_response",
+            "Bridge returned a response for another request or an invalid kind.",
+            502,
+        )
+    return sorted(messages, key=lambda message: message.sequence)
+
+
+def _response_remaining(request_id: str, deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ReplyTimeoutError(request_id)
+    return remaining
+
+
+async def _response_before_deadline(
+    request_id: str, deadline: float, operation: Callable[[], Awaitable[_Result]]
+) -> _Result:
+    remaining = _response_remaining(request_id, deadline)
+    try:
+        # This context ends before yielding to the caller. A timeout context
+        # spanning an async-generator yield would also cancel its caller's work.
+        async with asyncio.timeout(remaining):
+            result = await operation()
+    except TimeoutError:
+        raise ReplyTimeoutError(request_id) from None
+    except httpx.TimeoutException:
+        _response_remaining(request_id, deadline)
+        raise
+    _response_remaining(request_id, deadline)
     return result
 
 
@@ -212,6 +254,18 @@ class BridgeClient:
     def get_message(self, request_id: str) -> dict[str, Any]:
         """Fetch delivery and reply status for an existing request."""
         return _decode(self._client.get(_message_path(request_id)))
+
+    def list_response_messages(
+        self, request_id: str, *, after: int = 0, limit: int = 100
+    ) -> list[ReceivedMessage]:
+        """Read this request's ordered progress and final reply without consuming them."""
+        body = _decode(
+            self._client.get(
+                _message_path(request_id) + "/responses",
+                params=_received_params(after, limit, None),
+            )
+        )
+        return _response_messages(body, request_id)
 
     def wait_for_reply(
         self, request_id: str, *, timeout: float = 120, poll_interval: float = 0.5
@@ -395,6 +449,78 @@ class AsyncBridgeClient:
     async def get_message(self, request_id: str) -> dict[str, Any]:
         """Fetch delivery and reply status for an existing request."""
         return _decode(await self._client.get(_message_path(request_id)))
+
+    async def list_response_messages(
+        self, request_id: str, *, after: int = 0, limit: int = 100
+    ) -> list[ReceivedMessage]:
+        """Read this request's ordered progress and final reply without consuming them."""
+        body = _decode(
+            await self._client.get(
+                _message_path(request_id) + "/responses",
+                params=_received_params(after, limit, None),
+            )
+        )
+        return _response_messages(body, request_id)
+
+    async def iter_responses(
+        self,
+        request_id: str,
+        *,
+        timeout: float = 120,  # noqa: ASYNC109 - Fixed deadline bounds each network await.
+        poll_interval: float = 0.5,
+    ) -> AsyncIterator[ReceivedMessage]:
+        """Yield ordered progress receipts, then the final reply, without resending.
+
+        Stored progress is replayed before checking terminal request status.
+        Receipt sequences deduplicate overlapping pages. ``timeout`` covers the
+        entire iteration and does not restart when progress arrives.
+        """
+        _message_path(request_id)
+        duration = _positive(timeout, "timeout")
+        interval = _positive(poll_interval, "poll_interval")
+        deadline = time.monotonic() + duration
+        cursor = 0
+        final_required = False
+        while True:
+            messages = await _response_before_deadline(
+                request_id,
+                deadline,
+                lambda after=cursor: self.list_response_messages(
+                    request_id, after=after, limit=100
+                ),
+            )
+            previous_cursor = cursor
+            for message in messages:
+                if message.sequence <= cursor:
+                    continue
+                _response_remaining(request_id, deadline)
+                cursor = message.sequence
+                yield message
+                if message.kind == "reply":
+                    return
+            if len(messages) >= 100 and cursor > previous_cursor:
+                continue  # Drain all available pages before consulting final status.
+            if final_required:
+                raise BridgeError(
+                    "invalid_response",
+                    "Bridge reported a final reply without its response receipt.",
+                    502,
+                )
+            status = await _response_before_deadline(
+                request_id, deadline, lambda: self.get_message(request_id)
+            )
+            if _has_reply(status):
+                # A reply may have committed between the page and status reads.
+                # Its receipt must now appear; drain any intervening full pages.
+                final_required = True
+                continue
+            if status.get("reply_status") == "replied":
+                raise BridgeError(
+                    "invalid_response",
+                    "Bridge reported a final reply without valid reply text.",
+                    502,
+                )
+            await asyncio.sleep(min(interval, _response_remaining(request_id, deadline)))
 
     async def wait_for_reply(
         self,

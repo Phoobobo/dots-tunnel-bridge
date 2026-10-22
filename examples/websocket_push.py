@@ -54,7 +54,7 @@ async def receive(args, api_key):
                 )
             elif event_type == "response.output_text.delta":
                 print(event["delta"], end="", flush=True)
-            elif event_type == "response.completed":
+            elif event_type == "response.output_text.done":
                 print(flush=True)
             elif event_type in {"error", "response.failed", "response.incomplete"}:
                 raise RuntimeError(json.dumps(event, ensure_ascii=False))

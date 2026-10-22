@@ -539,6 +539,7 @@ async def test_real_oauth_narrowed_tokens_enforce_each_mcp_action_scope(tmp_path
         response = await rpc(client, reply_token, "tools/list")
         assert {tool["name"] for tool in response.json()["result"]["tools"]} == {
             "reply_to_app",
+            "report_progress",
             "send_to_app",
         }
         response = await rpc(

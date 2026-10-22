@@ -21,6 +21,7 @@ from .models import (
     EVENT,
     EVENT_NAME,
     MessageInput,
+    ProgressInput,
     PushInput,
     ReceivedAcknowledgement,
     ReceivedConsumer,
@@ -120,6 +121,25 @@ class DotsBridge:
             ) from None
         await self.initialize()
         return await self.store.list_received(**query.model_dump())
+
+    async def list_response_messages(
+        self, request_id: str, *, after: int = 0, limit: int = 100
+    ) -> list[dict]:
+        """Read this request's progress updates and final reply in receipt order."""
+        try:
+            query = ReceivedQuery(after=after, limit=limit)
+        except ValidationError:
+            raise BridgeError("invalid_received_query", "Invalid after or limit.", 422) from None
+        if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 200:
+            raise BridgeError("invalid_request_id", "Expected a valid request_id.", 422)
+        try:
+            request_id.encode("utf-8")
+        except UnicodeError:
+            raise BridgeError("invalid_request_id", "Expected a valid request_id.", 422) from None
+        await self.initialize()
+        return await self.store.list_response_messages(
+            request_id, after=query.after, limit=query.limit
+        )
 
     async def get_consumer_cursor(self, consumer_id: str, channel: str | None = None) -> int:
         self._validate_consumer(consumer_id, channel)
@@ -394,6 +414,25 @@ class DotsBridge:
             "reply": row["reply"],
             "replied_at": iso8601(row["replied_at"]),
         }
+
+    async def report_progress(self, request_id: str, text: str, *, idempotency_key: str) -> dict:
+        """Persist a plain-text update without completing the application request."""
+        try:
+            progress = ProgressInput(
+                request_id=request_id, text=text, idempotency_key=idempotency_key
+            )
+        except ValidationError:
+            raise BridgeError(
+                "invalid_progress",
+                "Expected valid request_id, progress text and idempotency_key.",
+                422,
+            ) from None
+        await self.initialize()
+        result = await self.store.save_progress(
+            progress.request_id, progress.text, idempotency_key=progress.idempotency_key
+        )
+        self._receiver.notify()
+        return result
 
     async def send_to_app(
         self,

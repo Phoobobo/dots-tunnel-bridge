@@ -30,13 +30,11 @@ from ..errors import BridgeError
 from ..models import MessageInput
 from ._openai_protocol import (
     ProtocolError,
+    ResponseEventStream,
     chat_chunks,
     chat_completion,
     latest_chat_text,
     latest_response_text,
-    response_finish_events,
-    response_object,
-    response_start_events,
 )
 from ._websocket_push import WebSocketPushSession
 
@@ -319,27 +317,48 @@ def create_openai_connector(
             return _error_response(error, request_id)
 
     async def completion_stream(request_id, completion_id, created, requested_model, include_usage):
-        task = asyncio.create_task(reply(request_id))
+        messages = bridge_client.iter_responses(request_id, timeout=reply_timeout)
+        task = asyncio.create_task(anext(messages))
         try:
             opening = chat_chunks(
                 "", completion_id=completion_id, created=created, model=requested_model
             )[0]
             yield "data: " + _json(opening) + "\n\n"
-            while not task.done():
+            while True:
                 await asyncio.wait({task}, timeout=HEARTBEAT_SECONDS)
                 if not task.done():
                     yield ": keep-alive\n\n"
-            text = await task
-            for chunk in chat_chunks(
-                text, completion_id=completion_id, created=created, model=requested_model
-            )[1:]:
+                    continue
+                try:
+                    message = await task
+                except StopAsyncIteration:
+                    raise BridgeError(
+                        "invalid_response", "Response ended before a final reply.", 502
+                    ) from None
+                text = message.text + ("\n\n" if message.kind == "progress" else "")
+                chunks = chat_chunks(
+                    text, completion_id=completion_id, created=created, model=requested_model
+                )
+                chunk = chunks[1]
+                chunk["dots_bridge"] = {
+                    "kind": message.kind,
+                    "request_id": message.request_id,
+                    "message_id": message.id,
+                    "sequence": message.sequence,
+                }
                 yield "data: " + _json(chunk) + "\n\n"
+                if message.kind == "reply":
+                    yield "data: " + _json(chunks[2]) + "\n\n"
+                    break
+                task = asyncio.create_task(anext(messages))
             if include_usage:
                 yield "data: " + _json({**opening, "choices": [], "usage": None}) + "\n\n"
         except (BridgeError, ReplyTimeoutError, httpx.HTTPError) as error:
             yield "data: " + _json(_error(error, request_id)[1]) + "\n\n"
         finally:
-            await _cancel(task)
+            with CancelScope(shield=True):
+                await _cancel(task)
+                await messages.aclose()
         yield "data: [DONE]\n\n"
 
     async def responses(socket: WebSocket):
@@ -371,38 +390,46 @@ def create_openai_connector(
             response_id = "resp_" + uuid.uuid4().hex
             created = int(time.time())
             stream_id = payload.get("stream_id")
-            kwargs = {
-                "response_id": response_id,
-                "created": created,
-                "model": requested_model,
-                "stream_id": stream_id,
-            }
-            for event in response_start_events(**kwargs):
+            event_stream = ResponseEventStream(
+                **{
+                    "response_id": response_id,
+                    "created": created,
+                    "model": requested_model,
+                    "stream_id": stream_id,
+                }
+            )
+            for event in event_stream.start():
                 await send_event(event)
             request_id = None
             try:
                 request_id = await enqueue(
                     latest_response_text(payload), requested_model, "responses.websocket"
                 )
-                text = await reply(request_id)
-                for event in response_finish_events(
-                    text, **kwargs, metadata={"dots_bridge_request_id": request_id}
-                ):
-                    await send_event(event)
+                messages = bridge_client.iter_responses(request_id, timeout=reply_timeout)
+                try:
+                    final_received = False
+                    async for message in messages:
+                        final_received = message.kind == "reply"
+                        for event in event_stream.message(
+                            message.text,
+                            final=final_received,
+                            metadata={"dots_bridge_request_id": request_id},
+                        ):
+                            await send_event(event)
+                    if not final_received:
+                        raise BridgeError(
+                            "invalid_response", "Response ended before a final reply.", 502
+                        )
+                finally:
+                    with CancelScope(shield=True):
+                        await messages.aclose()
             except (BridgeError, ReplyTimeoutError, httpx.HTTPError) as error:
                 _, body = _error(error, request_id)
-                failed = response_object(
-                    response_id=response_id,
-                    created=created,
-                    model=requested_model,
-                    status="failed",
+                for event in event_stream.fail(
                     error={"code": "server_error", "message": body["error"]["message"]},
                     metadata={"dots_bridge_request_id": request_id} if request_id else {},
-                )
-                event = {"type": "response.failed", "sequence_number": 2, "response": failed}
-                if stream_id is not None:
-                    event["stream_id"] = stream_id
-                await send_event(event)
+                ):
+                    await send_event(event)
 
         async def worker():
             while True:

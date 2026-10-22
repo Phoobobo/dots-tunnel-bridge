@@ -1,6 +1,7 @@
 """Short SQLite transactions; network calls never run inside a transaction."""
 
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -17,6 +18,26 @@ from .errors import BridgeError
 from .models import iso8601
 
 T = TypeVar("T")
+
+RECEIVED_TABLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS received_messages (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('reply', 'progress', 'push')), request_id TEXT,
+    channel TEXT NOT NULL, text TEXT NOT NULL, metadata TEXT NOT NULL,
+    received_at REAL NOT NULL, idempotency_key TEXT, fingerprint TEXT NOT NULL
+);
+"""
+
+RECEIVED_INDEX_SCHEMA = """
+CREATE INDEX IF NOT EXISTS received_messages_channel ON received_messages(channel, sequence);
+CREATE INDEX IF NOT EXISTS received_messages_request ON received_messages(request_id, sequence);
+CREATE UNIQUE INDEX IF NOT EXISTS received_messages_reply ON received_messages(request_id)
+    WHERE kind='reply';
+CREATE UNIQUE INDEX IF NOT EXISTS received_messages_push_key ON received_messages(idempotency_key)
+    WHERE kind='push';
+CREATE UNIQUE INDEX IF NOT EXISTS received_messages_progress_key
+    ON received_messages(request_id, idempotency_key) WHERE kind='progress';
+"""
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS bridge_meta (key TEXT PRIMARY KEY, value BLOB NOT NULL);
@@ -35,13 +56,6 @@ CREATE TABLE IF NOT EXISTS messages (
     event TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(delivery_status, next_attempt_at);
-CREATE TABLE IF NOT EXISTS received_messages (
-    sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('reply', 'push')), request_id TEXT UNIQUE,
-    channel TEXT NOT NULL, text TEXT NOT NULL, metadata TEXT NOT NULL,
-    received_at REAL NOT NULL, idempotency_key TEXT UNIQUE, fingerprint TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS received_messages_channel ON received_messages(channel, sequence);
 CREATE TABLE IF NOT EXISTS received_consumers (
     consumer_id TEXT PRIMARY KEY, channel TEXT, cursor INTEGER NOT NULL DEFAULT 0
 );
@@ -93,6 +107,28 @@ class Store:
                 if time.monotonic() >= deadline:
                     raise
 
+    @staticmethod
+    def _migrate_received_messages(db: sqlite3.Connection) -> None:
+        # Rebuilding removes schema 3's request-wide uniqueness while preserving
+        # all public receipt identities and the AUTOINCREMENT high-water mark.
+        sequence = db.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='received_messages'"
+        ).fetchone()
+        db.execute("ALTER TABLE received_messages RENAME TO received_messages_legacy")
+        db.execute(RECEIVED_TABLE_SCHEMA)
+        db.execute("INSERT INTO received_messages SELECT * FROM received_messages_legacy")
+        db.execute("DROP TABLE received_messages_legacy")
+        if sequence:
+            updated = db.execute(
+                "UPDATE sqlite_sequence SET seq=MAX(seq, ?) WHERE name='received_messages'",
+                (sequence[0],),
+            )
+            if not updated.rowcount:
+                db.execute(
+                    "INSERT INTO sqlite_sequence (name, seq) VALUES ('received_messages', ?)",
+                    (sequence[0],),
+                )
+
     async def initialize(self):
         async with self._lock:
             if self._ready:
@@ -100,10 +136,17 @@ class Store:
 
             def setup(db):
                 self._enable_wal(db)
-                db.executescript(SCHEMA)
                 db.execute("BEGIN IMMEDIATE")
+                had_received = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='received_messages'"
+                ).fetchone()
+                # executescript commits an existing transaction, so execute the
+                # static schema statements individually to keep migrations atomic.
+                for statement in SCHEMA.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
                 version = db.execute("SELECT value FROM bridge_meta WHERE key='schema'").fetchone()
-                if version and version[0] not in (b"1", b"2", b"3"):
+                if version and version[0] not in (b"1", b"2", b"3", b"4"):
                     raise BridgeError(
                         "storage_version", "Unsupported database schema version.", 500
                     )
@@ -130,11 +173,19 @@ class Store:
                         "INSERT INTO bridge_meta VALUES ('key_check', ?)",
                         (self.cipher.encrypt(b"dots-bridge"),),
                     )
-                # Keep older replies visible in the unified stream. The unique
-                # request_id makes this safe on migration retries and restarts.
+                if had_received and (not version or version[0] != b"4"):
+                    self._migrate_received_messages(db)
+                else:
+                    db.execute(RECEIVED_TABLE_SCHEMA)
+                for statement in RECEIVED_INDEX_SCHEMA.split(";"):
+                    if statement.strip():
+                        db.execute(statement)
+                # A final reply is backfilled even when progress for the same
+                # request already exists. The partial unique index prevents repeats.
                 replies = db.execute(
                     "SELECT * FROM messages WHERE reply IS NOT NULL AND request_id NOT IN "
-                    "(SELECT request_id FROM received_messages WHERE request_id IS NOT NULL) "
+                    "(SELECT request_id FROM received_messages "
+                    "WHERE kind='reply' AND request_id IS NOT NULL) "
                     "ORDER BY COALESCE(replied_at, created_at), request_id"
                 ).fetchall()
                 for reply in replies:
@@ -142,7 +193,7 @@ class Store:
                 db.execute(
                     "INSERT INTO bridge_meta VALUES ('schema', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (b"3",),
+                    (b"4",),
                 )
 
             await self.run(setup)
@@ -298,18 +349,7 @@ class Store:
                         "reply_conflict", "A different final reply is already stored.", 409
                     )
                 return dict(row)
-            if row["expires_at"] <= time.time():
-                raise BridgeError("reply_expired", "The reply deadline has passed.", 410)
-            sub = db.execute(
-                "SELECT id FROM subscriptions WHERE id=? AND expires_at>?",
-                (row["subscription_id"], time.time()),
-            ).fetchone()
-            if (
-                not sub
-                or row["reply_cancelled"]
-                or row["delivery_status"] in {"failed", "cancelled"}
-            ):
-                raise BridgeError("message_inactive", "This request is no longer active.", 409)
+            self._require_active_request(db, row)
             db.execute(
                 "UPDATE messages SET reply=?, replied_at=? WHERE request_id=?",
                 (text, time.time(), request_id),
@@ -319,6 +359,67 @@ class Store:
             ).fetchone()
             self._append_reply(db, saved)
             return dict(saved)
+
+        return await self.run(save)
+
+    @staticmethod
+    def _require_active_request(db: sqlite3.Connection, row: sqlite3.Row) -> None:
+        if row["expires_at"] <= time.time():
+            raise BridgeError("reply_expired", "The reply deadline has passed.", 410)
+        sub = db.execute(
+            "SELECT id FROM subscriptions WHERE id=? AND expires_at>?",
+            (row["subscription_id"], time.time()),
+        ).fetchone()
+        if not sub or row["reply_cancelled"] or row["delivery_status"] in {"failed", "cancelled"}:
+            raise BridgeError("message_inactive", "This request is no longer active.", 409)
+
+    async def save_progress(self, request_id: str, text: str, *, idempotency_key: str) -> dict:
+        def save(db):
+            db.execute("BEGIN IMMEDIATE")
+            request = db.execute(
+                "SELECT * FROM messages WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if not request:
+                raise BridgeError("message_not_found", "No matching message.", 404)
+            existing = db.execute(
+                "SELECT * FROM received_messages "
+                "WHERE kind='progress' AND request_id=? AND idempotency_key=?",
+                (request_id, idempotency_key),
+            ).fetchone()
+            if existing:
+                if existing["text"] != text:
+                    raise BridgeError(
+                        "idempotency_conflict",
+                        "This idempotency key was used with different input.",
+                        409,
+                    )
+                return public_received(dict(existing))
+            if request["reply"] is not None:
+                raise BridgeError("reply_completed", "This request already has a final reply.", 409)
+            self._require_active_request(db, request)
+            message_id = str(uuid4())
+            db.execute(
+                "INSERT INTO received_messages "
+                "(id, kind, request_id, channel, text, metadata, received_at, "
+                "idempotency_key, fingerprint) VALUES (?, 'progress', ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    message_id,
+                    request_id,
+                    request["channel"],
+                    text,
+                    request["metadata"],
+                    time.time(),
+                    idempotency_key,
+                    hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                ),
+            )
+            return public_received(
+                dict(
+                    db.execute(
+                        "SELECT * FROM received_messages WHERE id=?", (message_id,)
+                    ).fetchone()
+                )
+            )
 
         return await self.run(save)
 
@@ -351,7 +452,8 @@ class Store:
         def save(db):
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
-                "SELECT * FROM received_messages WHERE idempotency_key=?", (idempotency_key,)
+                "SELECT * FROM received_messages WHERE kind='push' AND idempotency_key=?",
+                (idempotency_key,),
             ).fetchone()
             if row:
                 if row["fingerprint"] != fingerprint:
@@ -399,6 +501,26 @@ class Store:
                     + channel_clause
                     + " ORDER BY sequence LIMIT ?",
                     parameters,
+                )
+            ]
+
+        return await self.run(query)
+
+    async def list_response_messages(
+        self, request_id: str, *, after: int = 0, limit: int = 100
+    ) -> list[dict]:
+        def query(db):
+            db.execute("BEGIN")
+            if not db.execute(
+                "SELECT 1 FROM messages WHERE request_id=?", (request_id,)
+            ).fetchone():
+                raise BridgeError("message_not_found", "No matching message.", 404)
+            return [
+                public_received(dict(row))
+                for row in db.execute(
+                    "SELECT * FROM received_messages WHERE request_id=? "
+                    "AND kind IN ('progress', 'reply') AND sequence>? ORDER BY sequence LIMIT ?",
+                    (request_id, after, limit),
                 )
             ]
 

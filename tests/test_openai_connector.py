@@ -11,7 +11,7 @@ import pytest
 from starlette.requests import ClientDisconnect
 from starlette.testclient import TestClient, WebSocketDenialResponse
 
-from dots_bridge import AsyncBridgeClient, BridgeError, ReplyTimeoutError
+from dots_bridge import AsyncBridgeClient, BridgeError, ReceivedMessage, ReplyTimeoutError
 from dots_bridge.connectors import create_openai_connector
 
 KEY = "test-connector-application-key"
@@ -40,7 +40,25 @@ class UpstreamHTTP:
             self.messages[request_id] = payload["text"]
             return httpx.Response(202, json={"request_id": request_id})
         if request.method == "GET" and request.url.path.startswith("/api/messages/"):
-            request_id = request.url.path.rsplit("/", 1)[1]
+            request_id = request.url.path.split("/")[3]
+            if request.url.path.endswith("/responses"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "messages": [
+                            {
+                                "sequence": 1,
+                                "id": "received_" + request_id,
+                                "kind": "reply",
+                                "request_id": request_id,
+                                "channel": "default",
+                                "text": "返信: " + self.messages[request_id],
+                                "metadata": {},
+                                "received_at": "2026-10-22T00:00:00Z",
+                            }
+                        ]
+                    },
+                )
             return httpx.Response(
                 200,
                 json={
@@ -110,6 +128,19 @@ class FakeBridge:
 
     async def release(self, request_id):
         self.releases[request_id].set()
+
+    async def iter_responses(self, request_id, *, timeout):  # noqa: ASYNC109
+        result = await self.wait_for_reply(request_id, timeout=timeout)
+        yield ReceivedMessage(
+            sequence=1,
+            id="received_" + request_id,
+            kind="reply",
+            request_id=request_id,
+            channel="default",
+            text=result["reply"],
+            metadata={},
+            received_at="2026-10-22T00:00:00Z",
+        )
 
     async def aclose(self):
         self.closed = True
@@ -214,7 +245,10 @@ async def test_http_sse_contains_complete_unicode_reply_and_done_without_consumi
     assert chunks[3]["usage"] is None
     assert {chunk["id"] for chunk in chunks} == {"chatcmpl-req_1"}
     assert len(upstream.sent) == 1
-    assert upstream.requests == [("POST", "/api/messages"), ("GET", "/api/messages/req_1")]
+    assert upstream.requests == [
+        ("POST", "/api/messages"),
+        ("GET", "/api/messages/req_1/responses"),
+    ]
 
 
 async def test_models_and_bearer_auth_reject_before_any_upstream_call():

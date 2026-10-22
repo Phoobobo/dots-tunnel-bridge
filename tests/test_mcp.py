@@ -111,6 +111,7 @@ async def test_modern_discovery_and_tools_survive_sdk_wire_validation():
             "get_current_user",
             "get_message",
             "reply_to_app",
+            "report_progress",
             "send_to_app",
         }
         reply = next(tool for tool in tools if tool["name"] == "reply_to_app")

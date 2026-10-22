@@ -37,6 +37,10 @@ class BridgeBackend(Protocol):
 
     async def reply_to_app(self, request_id: str, text: str) -> dict[str, Any]: ...
 
+    async def report_progress(
+        self, request_id: str, text: str, *, idempotency_key: str
+    ) -> dict[str, Any]: ...
+
     async def send_to_app(
         self,
         text: str,
@@ -184,6 +188,11 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
             "through this bridge, call reply_to_app with that request_id and your "
             "final response. get_message retrieves the original request. Only one "
             "final reply is stored per request; retry the same reply if needed. "
+            "You may call report_progress with the request_id and plain text to "
+            "send intermediate updates. Each new update needs its own unique "
+            "idempotency_key; reuse that key only when retrying the same update. "
+            "Progress does not complete the request: always use reply_to_app for "
+            "the final response. "
             "When the owner authorizes proactive messages, call send_to_app to "
             "send application messages without a prior request or subscription. "
             "Use reply_to_app for responses to application requests so they remain "
@@ -239,6 +248,43 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
         """
         try:
             return await bridge.reply_to_app(request_id, text)
+        except BridgeError as exc:
+            raise ToolError(f"{exc.code}: {exc.message}") from None
+
+    @mcp.tool(
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        auth=reply_auth,
+        meta=_security_meta("messages:reply"),
+    )
+    async def report_progress(
+        request_id: Annotated[str, Field(min_length=1, max_length=200)],
+        text: Annotated[str, Field(min_length=1, max_length=64000)],
+        idempotency_key: Annotated[
+            str,
+            Field(
+                min_length=1,
+                max_length=128,
+                description=(
+                    "A unique key for this progress update. Reuse it on retries of the same "
+                    "update and choose a different key for each new update."
+                ),
+            ),
+        ],
+    ) -> dict[str, Any]:
+        """Send a plain-text intermediate update for an application request.
+
+        This does not complete the request or replace its final reply. Call
+        reply_to_app with the same request_id when the final response is ready.
+        Retrying the same request_id, idempotency_key and text does not duplicate
+        the update; reusing the key with different text is rejected.
+        """
+        try:
+            return await bridge.report_progress(request_id, text, idempotency_key=idempotency_key)
         except BridgeError as exc:
             raise ToolError(f"{exc.code}: {exc.message}") from None
 

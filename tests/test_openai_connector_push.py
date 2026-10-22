@@ -60,7 +60,7 @@ class BridgeHTTP:
             self.sent.append(payload)
             return httpx.Response(202, json={"request_id": f"req_{len(self.sent)}"})
         if request.method == "GET" and path.startswith("/api/messages/"):
-            request_id = path.rsplit("/", 1)[1]
+            request_id = path.split("/")[3]
             text = self.sent[int(request_id.removeprefix("req_")) - 1]["text"]
             if text == "blocked":
                 self.reply_release = asyncio.Event()
@@ -70,6 +70,24 @@ class BridgeHTTP:
                 except asyncio.CancelledError:
                     self.reply_cancelled.set()
                     raise
+            if path.endswith("/responses"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "messages": [
+                            {
+                                "id": "response_" + request_id,
+                                "sequence": 1000,
+                                "kind": "reply",
+                                "request_id": request_id,
+                                "channel": "work",
+                                "text": "Reply: " + text,
+                                "metadata": {},
+                                "received_at": "2026-10-22T00:00:00Z",
+                            }
+                        ]
+                    },
+                )
             return httpx.Response(
                 200,
                 json={

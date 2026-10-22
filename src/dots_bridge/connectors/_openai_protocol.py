@@ -2,7 +2,7 @@
 
 The bridge receives only the latest user message. It does not replay the
 caller's conversation history or forward the caller's system instructions.
-Streaming objects describe one completed bridge reply, not token generation.
+Streaming objects describe complete progress/final messages, not token generation.
 """
 
 from __future__ import annotations
@@ -162,13 +162,16 @@ def _part(text: str) -> dict[str, Any]:
     return {"type": "output_text", "text": text, "annotations": [], "logprobs": []}
 
 
-def _item(response_id: str, *, text: str | None, status: str) -> dict[str, Any]:
+def _item(
+    response_id: str, *, text: str | None, status: str, phase: str | None = None
+) -> dict[str, Any]:
     return {
         "id": f"msg_{response_id}",
         "type": "message",
         "role": "assistant",
         "status": status,
         "content": [] if text is None else [_part(text)],
+        **({"phase": phase} if phase is not None else {}),
     }
 
 
@@ -181,6 +184,7 @@ def response_object(
     text: str | None = None,
     error: dict[str, Any] | None = None,
     metadata: dict[str, Any] | None = None,
+    output: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Serialize a Responses object with optional final text or a failure error."""
     item_status = status if status in {"in_progress", "completed"} else "incomplete"
@@ -194,7 +198,9 @@ def response_object(
         "incomplete_details": None,
         "instructions": None,
         "model": model,
-        "output": [] if text is None else [_item(response_id, text=text, status=item_status)],
+        "output": deepcopy(output)
+        if output is not None
+        else ([] if text is None else [_item(response_id, text=text, status=item_status)]),
         "parallel_tool_calls": False,
         "tool_choice": "none",
         "tools": [],
@@ -244,6 +250,43 @@ def response_start_events(
     )
 
 
+def _message_events(
+    text: str,
+    *,
+    response_id: str,
+    output_index: int = 0,
+    phase: str | None = None,
+) -> list[dict[str, Any]]:
+    item_index = {"output_index": output_index}
+    content_index = {**item_index, "item_id": f"msg_{response_id}", "content_index": 0}
+    return [
+        {
+            "type": "response.output_item.added",
+            **item_index,
+            "item": _item(response_id, text=None, status="in_progress", phase=phase),
+        },
+        {"type": "response.content_part.added", **content_index, "part": _part("")},
+        {
+            "type": "response.output_text.delta",
+            **content_index,
+            "delta": text,
+            "logprobs": [],
+        },
+        {
+            "type": "response.output_text.done",
+            **content_index,
+            "text": text,
+            "logprobs": [],
+        },
+        {"type": "response.content_part.done", **content_index, "part": _part(text)},
+        {
+            "type": "response.output_item.done",
+            **item_index,
+            "item": _item(response_id, text=text, status="completed", phase=phase),
+        },
+    ]
+
+
 def response_finish_events(
     text: str,
     *,
@@ -254,34 +297,9 @@ def response_finish_events(
     metadata: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Return sequence 2–8 for a complete text reply, following start events."""
-    item_index = {"output_index": 0}
-    content_index = {**item_index, "item_id": f"msg_{response_id}", "content_index": 0}
     return _events(
         [
-            {
-                "type": "response.output_item.added",
-                **item_index,
-                "item": _item(response_id, text=None, status="in_progress"),
-            },
-            {"type": "response.content_part.added", **content_index, "part": _part("")},
-            {
-                "type": "response.output_text.delta",
-                **content_index,
-                "delta": text,
-                "logprobs": [],
-            },
-            {
-                "type": "response.output_text.done",
-                **content_index,
-                "text": text,
-                "logprobs": [],
-            },
-            {"type": "response.content_part.done", **content_index, "part": _part(text)},
-            {
-                "type": "response.output_item.done",
-                **item_index,
-                "item": _item(response_id, text=text, status="completed"),
-            },
+            *_message_events(text, response_id=response_id),
             {
                 "type": "response.completed",
                 "response": response_object(
@@ -317,3 +335,88 @@ def response_events(
         "metadata": metadata,
     }
     return response_start_events(**arguments) + response_finish_events(text, **arguments)
+
+
+class ResponseEventStream:
+    """One Responses lifecycle containing commentary messages and one final answer."""
+
+    def __init__(
+        self, *, response_id: str, created: int, model: str, stream_id: str | None = None
+    ) -> None:
+        self.response_id = response_id
+        self.created = created
+        self.model = model
+        self.stream_id = stream_id
+        self._sequence = 0
+        self._output: list[dict[str, Any]] = []
+        self._finished = False
+
+    def _number(self, events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        result = _events(events, first_sequence=self._sequence, stream_id=self.stream_id)
+        self._sequence += len(result)
+        return result
+
+    def start(self) -> list[dict[str, Any]]:
+        return self._number(
+            response_start_events(
+                response_id=self.response_id,
+                created=self.created,
+                model=self.model,
+            )
+        )
+
+    def _response(
+        self, *, status: str, metadata: dict[str, Any] | None, error: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return response_object(
+            response_id=self.response_id,
+            created=self.created,
+            model=self.model,
+            status=status,
+            output=self._output,
+            metadata=metadata,
+            error=error,
+        )
+
+    def message(
+        self, text: str, *, final: bool, metadata: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        if self._finished:
+            raise ValueError("Response is already finished")
+        index = len(self._output)
+        item_response_id = self.response_id if index == 0 else f"{self.response_id}_{index}"
+        events = _message_events(
+            text,
+            response_id=item_response_id,
+            output_index=index,
+            phase="final_answer" if final else "commentary",
+        )
+        self._output.append(deepcopy(events[-1]["item"]))
+        if final:
+            self._finished = True
+            events.append(
+                {
+                    "type": "response.completed",
+                    "response": self._response(status="completed", metadata=metadata),
+                }
+            )
+        return self._number(events)
+
+    def fail(
+        self, *, error: dict[str, Any], metadata: dict[str, Any] | None = None
+    ) -> list[dict[str, Any]]:
+        if self._finished:
+            raise ValueError("Response is already finished")
+        self._finished = True
+        return self._number(
+            [
+                {
+                    "type": "response.failed",
+                    "response": self._response(
+                        status="failed",
+                        metadata=metadata,
+                        error=error,
+                    ),
+                }
+            ]
+        )
