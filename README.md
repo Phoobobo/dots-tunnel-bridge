@@ -473,13 +473,32 @@ with client.responses.connect(max_retries=0) as connection:
 `stream_id`を指定すると各イベントに同じ値を返しますが、処理は1接続内でFIFOです。
 異なるWebSocket接続とHTTPリクエストは並行して利用できます。
 
-実行できるサンプルもあります。
+対話チャットのサンプルがあります。`dots-bridge connector openai`を起動したまま、別ターミナルで実行します。
 
 ```sh
-python examples/openai_client.py --mode chat "こんにちは"
-python examples/openai_client.py --mode stream "こんにちは"
-python examples/openai_client.py --mode websocket "こんにちは"
+python -m pip install 'openai[realtime]>=3.8,<4' 'prompt-toolkit>=3.0.43,<4'
+python examples/openai_client.py --mode chat
+python examples/openai_client.py --mode stream
+python examples/openai_client.py --mode websocket
 ```
+
+どのmodeも`user>`で入力してEnterで送信し、返信を`dots>`に表示します。
+`stream`と`websocket`では途中結果を`progress>`に表示します。
+`/exit`、`/quit`、Ctrl+C、Ctrl+Dで終了します。
+`prompt-toolkit`は既存の`.[chat]` extraでインストールしても構いません。
+各要求では最新の入力1件だけを送り、過去の履歴を積み直しません。会話の文脈はdots側で保持します。
+
+最初の文章を引数で渡すと、自動送信後も対話を続けます。
+
+```sh
+python examples/openai_client.py --mode stream "こんにちは"
+```
+
+WSモードは同じ接続で何度でも会話でき、待機中・入力中の自発pushも`push>`に表示してからACKします。
+SDKの`recv_bytes()`を単一の受信ループで読み、Responsesイベントと独自の`dots.*`イベントを振り分けます。
+pushの処理位置には`--consumer-id`を使い、既定値は`example-openai`です。
+同じIDの別接続を同時に動かさず、別の受信先として使う場合はIDを変更してください。
+このサンプルのACKは表示完了を表します。実際のアプリでは必要な取り込みが成功してからACKしてください。
 
 ### WebSocketで自発pushも受信する
 
