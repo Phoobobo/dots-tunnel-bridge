@@ -76,6 +76,8 @@ async def run_chat(
 ):
     @bridge.on_received
     async def received(message: ReceivedMessage):
+        if message.kind == "cancel":
+            return
         print(f"dots> {message.text}", flush=True)
 
     print("Enterで送信、/exit・Ctrl+C・Ctrl+Dで終了します。", flush=True)

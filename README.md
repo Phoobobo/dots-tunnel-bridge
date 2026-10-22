@@ -47,7 +47,7 @@ wheelも作成できます。PyPIへの公開は別途行う作業です。
 ```sh
 python -m pip install build
 python -m build
-python -m pip install dist/dots_bridge-0.5.0-py3-none-any.whl
+python -m pip install dist/dots_bridge-0.6.0-py3-none-any.whl
 ```
 
 ## サーバーの起動
@@ -94,7 +94,7 @@ ngrok http 8765 --url https://YOUR-DOMAIN.ngrok.app
 2. MCP URLを`https://YOUR-DOMAIN.ngrok.app/mcp`、認証をOAuthにします。
 3. 登録画面に表示された**正確な**callback URLを、`bridge.toml`の`redirect_uri`に設定してサーバーを再起動します。
 4. 下表の値で登録・接続し、同意画面には`owner_key`を入力します。
-5. 公開一覧に`app.message.created`、`get_current_user`、`get_message`、`report_progress`、`reply_to_app`、`send_to_app`が表示されることを確認します。変更後はツール・イベントを再スキャンします。
+5. 公開一覧に`app.message.created`、`get_current_user`、`get_message`、`report_progress`、`reply_to_app`、`cancel_request`、`send_to_app`が表示されることを確認します。変更後はツール・イベントを再スキャンします。
 
 | 登録項目 | 値 |
 | --- | --- |
@@ -120,7 +120,9 @@ callback URLとWebhook secretは、購読時にdots側からサーバーへ渡�
 > この接続は私のアプリです。届いたdata.textを私からの依頼として処理し、
 > 途中結果を伝える場合は、同じdata.request_idと通常の文章を使ってreport_progressを呼んでください。
 > idempotency_keyは途中結果ごとに一意にし、同じ途中結果の再試行では同じ値を使ってください。
-> 最終回答は必ずdata.request_idと回答本文を使ってreply_to_appへ返してください。
+> 有効な依頼の最終回答はdata.request_idと回答本文を使ってreply_to_appへ返してください。
+> 後続の依頼が元の依頼を明確に置き換えた場合だけ、古いrequest_idと新しいrequest_idを使ってcancel_request(request_id, superseded_by)を呼んでください。
+> 独立した依頼はcancelせず続けてください。通常の完了や対応不要という結論はreply_to_appで返し、最後に有効な依頼には必ず最終回答を返してください。
 > 通常確認が必要な操作は、この経路でも確認してください。
 > 購読できたか、その結果も教えてください。
 
@@ -133,6 +135,7 @@ dotsから依頼に紐づかないメッセージも送ってほしい場合は�
 | --- | --- |
 | `report_progress(request_id, text, idempotency_key)` | 依頼に紐づく途中結果。依頼は未完了のまま |
 | `reply_to_app(request_id, text)` | 依頼の最終回答。依頼ごとに1件 |
+| `cancel_request(request_id, superseded_by)` | 後続要求に置き換わった古い要求の待機を終了 |
 | `send_to_app(text, idempotency_key, ...)` | 依頼に紐づかない自発メッセージ |
 
 MCPツールの呼び出し引数はJSONですが、`text`本文は普通の文字列です。
@@ -140,8 +143,8 @@ dotsに構造化JSONの回答本文を作らせる必要はありません。途
 `send_to_app`は先行する依頼やイベント購読を必要としません。OAuth接続と`messages:reply`権限が必要です。
 dots側の画面や会話の文章が自動転送されるわけではなく、これらのツールを呼んだ内容がアプリへ届きます。
 
-既存の接続で途中結果に対応する場合は、更新後のbridgeとコネクターを両方再起動し、MCPツールを再スキャンしてください。
-そのうえで、上の`report_progress`を含む指示をdotsへ伝え直します。
+既存の接続で途中結果・cancelに対応する場合は、更新後のbridgeとコネクターを両方再起動し、MCPツールを再スキャンしてください。
+そのうえで、上の`report_progress`や下記のcancelの用途をdotsへ伝えます。
 
 プラグインの接続とイベント購読は別の手順です。購読は`subscriptions`で確認できます。
 
@@ -212,6 +215,9 @@ async def main():
 
         @bridge.on_received
         async def received(message: ReceivedMessage):
+            if message.kind == "cancel":
+                # このrequest_idの待機タスクや一時バッファを片付けます。
+                return
             # ここで表示、音声再生、アプリの状態更新などを行います。
             print(message.kind, message.request_id, message.text)
 
@@ -234,8 +240,9 @@ asyncio.run(main())
 | 属性 | 内容 |
 | --- | --- |
 | `text` | dotsからの本文 |
-| `kind` | 途中結果なら`progress`、最終返信なら`reply`、自発メッセージなら`push` |
-| `request_id` | 途中結果・最終返信の依頼ID。自発メッセージなら`None` |
+| `kind` | 途中結果なら`progress`、最終返信なら`reply`、置き換えによる終了なら`cancel`、自発メッセージなら`push` |
+| `request_id` | 途中結果・最終返信・cancelの依頼ID。自発メッセージなら`None` |
+| `superseded_by` | `cancel`の置き換え先要求ID。それ以外は`None` |
 | `channel` | 受信先のchannel |
 | `metadata` | 途中結果・最終返信なら元の依頼のmetadata、自発メッセージならツールで指定したmetadata |
 | `id` | 受信メッセージの一意なID。再処理時も同じ値 |
@@ -340,11 +347,36 @@ async for message in client.iter_responses(queued["request_id"], timeout=120):
     print(message.kind, message.text)
 ```
 
-保存済みの途中結果も保存順に返し、`kind="reply"`で終了します。
+保存済みの途中結果も保存順に返し、`kind="reply"`または`kind="cancel"`で終了します。
 `timeout`は反復全体の固定期限で、途中結果が届いても延長しません。
 依頼の再送やconsumerのACKは行わず、`on_received`とも併用できます。
 一覧を自分で取得する場合は、同期・非同期クライアントの`list_response_messages(request_id, after=0, limit=100)`を使います。
 `after`に最後の`sequence`を指定すると、その続きから取得できます。
+
+## 後続要求へ切り替えるcancel
+
+新しい要求が古い要求を明確に置き換えると判断したとき、dotsは
+`cancel_request(request_id="古いID", superseded_by="新しいID")`を呼びます。
+独立した依頼は並行して継続します。通常の完了や「対応不要」という結論は、
+`reply_to_app`で最終回答を返します。最後に有効な要求には必ず最終回答を返す方針をMCPの説明にも定義しています。
+
+置き換え先には、同じchannel・subscriptionの実在する新しい要求が必要です。
+古い要求は未完了である必要があり、自分自身や過去の要求を置き換え先には指定できません。
+同じ組み合わせの再試行は同じ通知を返し、別の置き換え先への変更は拒否します。
+cancel後の古い要求には新しい途中結果・最終回答を保存できません。
+
+アプリには次の受信が届きます。`request_id`単位で待機タスクやプログレスの一時バッファを破棄してください。
+ブリッジの記録とconsumerの処理位置は保持します。すでに端末へ表示した文章は履歴として残ります。
+
+```json
+{"kind":"cancel","request_id":"req_old","superseded_by":"req_new","text":""}
+```
+
+実際の受信には他の`ReceivedMessage`属性も付きます。
+`on_received`では通常の受信として処理し、`iter_responses`ではcancelを最後に反復が終了します。
+最終回答だけを待つ`ask`・`wait_for_reply`は`RequestCancelledError`で待機を終えます。
+例外の`request_id`・`superseded_by`で対象を識別し、表示せず処理を終えられます。
+cancelはブリッジの返信待ちを終了する通知です。実行済みの外部操作を取り消したり、dotsの実行環境を強制停止したりはしません。
 
 ## OpenAI互換コネクター
 
@@ -424,12 +456,14 @@ with OpenAI(
 
 `stream=False`の通常REST応答は最終回答だけを返します。
 `stream=True`では、最初にassistant role、続いて届いた途中結果と最終回答をそれぞれcontent chunkで返します。
-途中結果の本文末尾には`\n\n`を加えて区切り、`finish_reason: "stop"`は最終回答の後だけ、`[DONE]`は最後に送ります。
+途中結果の本文末尾には`\n\n`を加えて区切り、最終回答またはcancelの後に`finish_reason: "stop"`、最後に`[DONE]`を送ります。
 これはツールへ渡された文章単位の配信で、dotsの生成トークンを逐次取得するものではありません。
 待機中はSSEのコメントを送り、トークン数・料金は取得できないためusageを推定しません。
 
 各content chunkには、dots-bridge独自の`dots_bridge`属性も付きます。
 `kind`で途中結果と最終回答を区別し、`message_id`と`sequence`で受信を識別できます。
+cancel時は`dots_bridge.kind="cancel"`と`superseded_by`を通知し、追加の回答本文を出さずにストリームを終了します。
+通常RESTのcancelは、空のassistant回答と同じ`dots_bridge`情報を持つHTTP 200応答です。
 
 ```json
 {
@@ -475,13 +509,17 @@ with client.responses.connect(max_retries=0) as connection:
 1回の依頼は同じresponse IDを使い、各文章を別のoutput itemとして追加します。
 途中結果のitemは`phase="commentary"`、最終回答のitemは`phase="final_answer"`です。
 途中結果の`response.output_item.done`はそのitemの完了であり、依頼全体は完了しません。
-最終回答の後にだけ`response.completed`を1回返し、その`response.output`に途中結果と最終回答の全itemを含めます。
+最終回答の後に`response.completed`を1回返し、その`response.output`に途中結果と最終回答の全itemを含めます。
 失敗時の`response.failed`も、それまでに届いた途中結果を`response.output`へ保持します。
+cancel時も待機が終わるよう`response.completed`を返し、`response.status="cancelled"`、`response.output=[]`になります。
+`response.metadata`の`dots_bridge_kind="cancel"`、`dots_bridge_request_id`、`dots_bridge_superseded_by`で対象と置き換え先を識別できます。
+このcancel通知の対応付けはdots-bridge独自の拡張です。
 
 上の受信例は途中結果も表示します。最終回答だけ必要な場合は、完了応答の`response.output`から
 `item.phase == "final_answer"`のmessageだけを選び、そのcontentを使ってください。
 途中結果の受信に`dots.subscribe`は不要です。
-`stream_id`を指定すると各イベントに同じ値を返しますが、処理は1接続内でFIFOです。
+`stream_id`を指定すると各イベントに同じ値を返します。応答イベントは1接続内でFIFOです。
+受信した次の要求は先にdotsへ送るため、前の回答を待っている間にも置き換えを判断できます。
 異なるWebSocket接続とHTTPリクエストは並行して利用できます。
 
 対話チャットのサンプルがあります。`dots-bridge connector openai`を起動したまま、別ターミナルで実行します。
@@ -498,6 +536,20 @@ python examples/openai_client.py --mode websocket
 `/exit`、`/quit`、Ctrl+C、Ctrl+Dで終了します。
 `prompt-toolkit`は既存の`.[chat]` extraでインストールしても構いません。
 各要求では最新の入力1件だけを送り、過去の履歴を積み直しません。会話の文脈はdots側で保持します。
+
+返信待ち中にも入力してcancelを試す場合は`--interruptible`を付けます。
+
+```sh
+python examples/openai_client.py --mode stream --interruptible
+# WebSocketも同じ接続で後続要求を送れます。
+python examples/openai_client.py --mode websocket --interruptible
+```
+
+例えば「渋谷で明日のランチ候補を調べて。途中経過も教えて」と送信し、回答待ちの間に
+「さっきの渋谷の依頼はやめて、代わりに新宿で調べて」と入力します。
+dotsが`cancel_request`を呼ぶと古い待機が表示なしで終了し、新しい要求の最終回答を待ち続けます。
+新しい要求を送っただけで自動cancelはしません。別件として送った独立した依頼は継続できます。
+直接bridgeを利用する`python examples/chat.py`も返信待ち中に入力でき、cancelを表示せず処理します。
 
 エラー時は原因コード、メッセージ、要求ID、経過秒を表示します。
 SSEの途中で失敗した場合も`bridge_reply_timeout`などの原因を確認できます。
@@ -592,7 +644,7 @@ python examples/websocket_push.py --consumer-id personal-agent --message "こん
 別のIDで購読すると保存済みのpushを先頭から別途受信します。英数字と`_ . : -`の1〜118文字が使え、bridge内部のconsumerは`openai-ws:<consumer_id>`です。
 channelはコネクター起動時の`--channel`に固定されます。同じconsumerでchannelを変更しないでください。
 同じコネクタープロセス内では、同じconsumerの同時購読は409で拒否します。別プロセスのコネクター同士でも同じconsumerを同時に使わないでください。
-このpush専用consumerでは、依頼に紐づく`progress`・`reply`を読み飛ばしてACKします。
+このpush専用consumerでは、依頼に紐づく`progress`・`reply`・`cancel`を読み飛ばしてACKします。
 他のconsumerの処理位置には影響しません。
 
 ### 互換範囲
@@ -602,7 +654,7 @@ channelはコネクター起動時の`--channel`に固定されます。同じco
 - `model`は互換クライアント用の名前です。別名でも同じdotsへ届き、モデルを切り替えません。temperatureやトークン上限などの生成設定は無視します。
 - 画像・音声・ファイル、クライアント指定のtools、構造化出力、複数候補、warmup、steering、ResponsesのHTTP APIや保存済み応答の取得は未対応です。最新のメッセージが非テキストや空の場合はエラーにし、古い依頼を代わりに送信しません。
 - WebSocketは`response.create`に対する返信に加え、独自の`dots.subscribe`による自発push購読に対応します。pushはResponsesの完了イベントに混ぜず、利用側からの明示ACKで処理済みにします。
-- 通常RESTは最終回答のみ、SSEとResponses WebSocketは途中結果も返します。途中結果は完了扱いにせず、最終回答で依頼を閉じます。
+- 通常RESTは最終回答のみ、SSEとResponses WebSocketは途中結果も返します。途中結果は完了扱いにせず、最終回答またはcancelで依頼を閉じます。
 - 接続が切れたり待機がタイムアウトしても、送信済みのdotsへの依頼は継続します。HTTP応答の`X-Dots-Request-ID`、エラー内の`request_id`、WS完了・失敗応答の`metadata.dots_bridge_request_id`で状態を調べられます。
 - コネクターは依頼を自動再送しません。HTTPエラーでは公式SDK向けに`x-should-retry: false`を返します。切断後も再送を避けたい場合は呼び出し側で自動再試行を無効にし、HTTPでは同じ`Idempotency-Key`ヘッダーを付けて再実行できます（128文字以内）。
 - 入力全体は300 KiB、転送する最新のテキストは16,000文字までです。WSは処理中の1件に加え16件まで待機できます。ブラウザーからの異なるoriginへのアクセスは許可しません。
@@ -621,15 +673,15 @@ Pythonアプリから直接起動する場合は、`dots_bridge.connectors.creat
 | `GET /api/subscriptions` | 有効な購読のID、channel、期限。callbackやsecretは返さない |
 | `POST /api/messages` | 依頼を保存して202を返す |
 | `GET /api/messages/{request_id}` | 配送状態と保存済みの最終返信を取得 |
-| `GET /api/messages/{request_id}/responses?after=0&limit=100` | その依頼の途中結果・最終返信を保存順で取得 |
+| `GET /api/messages/{request_id}/responses?after=0&limit=100` | その依頼の途中結果・最終返信・cancelを保存順で取得 |
 | `DELETE /api/subscriptions/{subscription_id}` | 購読を解除し、未配送依頼をキャンセル |
-| `GET /api/received?after=0&limit=100&channel=default` | 途中結果・最終返信・自発メッセージの受信一覧（channelは省略可能） |
+| `GET /api/received?after=0&limit=100&channel=default` | 途中結果・最終返信・cancel・自発メッセージの受信一覧（channelは省略可能） |
 | `GET /api/consumers/{consumer_id}?channel=default` | consumerの処理位置を取得・初期化 |
 | `POST /api/consumers/{consumer_id}/ack` | `{"sequence": 123, "channel": "default"}`で処理位置を進める |
 
 受信一覧・依頼ごとの応答一覧の戻り値は`{"messages": [...]}`、consumer操作の戻り値は`{"cursor": 123}`です。
 `after`は指定番号よりあとの受信、`limit`は1〜100件です。
-依頼ごとの応答一覧は`progress`・`reply`だけを返し、依頼が存在しない場合は404です。
+依頼ごとの応答一覧は`progress`・`reply`・`cancel`を返し、依頼が存在しない場合は404です。
 通常はクライアントのバックグラウンド受信が一覧取得とACKを行います。
 手動で扱う場合は同期・非同期クライアントの`list_received()`、`get_consumer_cursor()`、`acknowledge_received()`を使えます。
 受信一覧の取得だけでは処理位置は進みません。
@@ -654,6 +706,7 @@ Pythonアプリから直接起動する場合は、`dots_bridge.connectors.creat
 | `delivery_status` | `queued` / `delivering` / `accepted` / `failed` / `cancelled` |
 | `reply_status` | `pending` / `replied` / `expired` / `cancelled` |
 | `reply` | 保存済みの最終返信。未返信時は`null` |
+| `superseded_by` / `cancelled_at` | 置き換えによるcancel時だけ返す、後続要求IDと取消日時 |
 | `attempts` | Webhookの試行回数 |
 | `status_code` | 最後に得たWebhookのHTTPステータス |
 | `error` | 秘密情報を含まないエラーコード。成功時は`null` |
@@ -686,7 +739,7 @@ OAuthのwell-knownと運用エンドポイントを公開originのルートか�
 - **単一所有者向けです。** 複数テナント・一般公開の本人確認基盤は提供しません。
 - 設定はTOML、購読、依頼、配送状態、途中結果・最終返信・自発メッセージ、受信処理位置、OAuth状態はSQLiteに保存します。
   OAuthアクセストークンは1時間、refresh tokenは30日です。再起動で接続状態を失いません。
-- 既存dots-bridgeのschema 1〜3は、次回bridge起動時に同一トランザクションでschema 4へ自動移行します。
+- 既存dots-bridgeのschema 1〜4は、次回bridge起動時に同一トランザクションでschema 5へ自動移行します。
   保存済みの受信ID・sequence・consumerの処理位置を維持します。コネクターはDBを直接操作しません。
 - Webhookのcallback URLとsecretはFernetで暗号化します。本文・返信・metadataを含むDB全体の暗号化は行いません。
   DB・設定・バックアップは所有者のみ読める場所に置いてください。

@@ -20,6 +20,7 @@ from .errors import BridgeError
 from .models import (
     EVENT,
     EVENT_NAME,
+    CancellationInput,
     MessageInput,
     ProgressInput,
     PushInput,
@@ -430,6 +431,23 @@ class DotsBridge:
         await self.initialize()
         result = await self.store.save_progress(
             progress.request_id, progress.text, idempotency_key=progress.idempotency_key
+        )
+        self._receiver.notify()
+        return result
+
+    async def cancel_request(self, request_id: str, *, superseded_by: str) -> dict:
+        """Close an obsolete request in favor of a newer request, without interrupting dots."""
+        try:
+            cancellation = CancellationInput(request_id=request_id, superseded_by=superseded_by)
+        except ValidationError:
+            raise BridgeError(
+                "invalid_cancellation",
+                "Expected valid request_id and superseded_by request IDs.",
+                422,
+            ) from None
+        await self.initialize()
+        result = await self.store.cancel_request(
+            cancellation.request_id, superseded_by=cancellation.superseded_by
         )
         self._receiver.notify()
         return result

@@ -11,6 +11,8 @@ bridge = DotsBridge(settings)
 
 @bridge.on_received
 async def received(message: ReceivedMessage):
+    if message.kind == "cancel":
+        return
     print(message.kind, message.request_id, message.text)
 
 

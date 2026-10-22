@@ -53,6 +53,26 @@ class ProgressInput(BaseModel):
         return value
 
 
+class CancellationInput(BaseModel):
+    """An obsolete request and the newer request that clearly replaces it."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    request_id: str = Field(min_length=1, max_length=200)
+    superseded_by: str = Field(min_length=1, max_length=200)
+
+    @field_validator("request_id", "superseded_by")
+    @classmethod
+    def nonempty_unicode(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must contain a non-whitespace character")
+        try:
+            value.encode("utf-8")
+        except UnicodeError:
+            raise ValueError("value must contain valid Unicode text") from None
+        return value
+
+
 class ReceivedMessage(BaseModel):
     """One durable final reply, intermediate result, or proactive message from dots."""
 
@@ -60,12 +80,13 @@ class ReceivedMessage(BaseModel):
 
     sequence: int = Field(ge=1)
     id: str
-    kind: Literal["reply", "progress", "push"]
+    kind: Literal["reply", "progress", "push", "cancel"]
     request_id: str | None
     channel: str
     text: str
     metadata: dict[str, Any]
     received_at: str
+    superseded_by: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class ReceivedAcknowledgement(BaseModel):

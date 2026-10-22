@@ -46,6 +46,14 @@ class PendingSession:
             self.cancelled.set()
 
 
+class QueuedSession:
+    def __init__(self):
+        self.inputs = asyncio.Queue()
+
+    async def prompt_async(self, prompt):
+        return await self.inputs.get()
+
+
 def chunk(text=None, *, kind=None, finish=None, choices=True, request_id=None):
     metadata = {"kind": kind} if kind else {}
     if request_id is not None:
@@ -94,6 +102,20 @@ class FakeStream:
         if isinstance(item, Exception):
             raise item
         return item
+
+
+class QueuedStream(FakeStream):
+    def __init__(self, *chunks):
+        super().__init__([])
+        self.queue = asyncio.Queue()
+        self.waiting = asyncio.Event()
+        for item in chunks:
+            self.queue.put_nowait(item)
+
+    async def __anext__(self):
+        if self.queue.empty():
+            self.waiting.set()
+        return await self.queue.get()
 
 
 class FakeCompletions:
@@ -610,6 +632,138 @@ async def test_caller_cancellation_is_not_swallowed_as_a_turn_error():
     assert len(client.chat.completions.requests) == 1
 
 
+@pytest.mark.parametrize("mode", ["chat", "stream"])
+async def test_cancelled_http_turn_is_silent_and_next_serial_turn_can_finish(mode, capsys):
+    client = FakeClient()
+    original_create = client.chat.completions.create
+    cancellation = {"kind": "cancel", "request_id": "req_a", "superseded_by": "req_b"}
+    cancel_chunk = chunk(choices=False)
+    cancel_chunk.dots_bridge = cancellation
+    cancelled_stream = FakeStream(
+        [
+            chunk("Aの途中経過\n\n", kind="progress"),
+            cancel_chunk,
+            RuntimeError("must not be read after cancellation"),
+        ]
+    )
+
+    async def create(**payload):
+        if payload["messages"][0]["content"] == "A":
+            client.chat.completions.requests.append(payload)
+            if mode == "stream":
+                return cancelled_stream
+            return SimpleNamespace(choices=[], dots_bridge=cancellation)
+        return await original_create(**payload)
+
+    client.chat.completions.create = create
+    await example.run_chat(client, ScriptedSession("A", "B", "/exit"), mode=mode)
+    output = capsys.readouterr().out
+    assert "dots> 返信: B" in output
+    assert output.count("dots> ") == 1
+    assert "system>" not in output
+    assert len(client.chat.completions.requests) == 2
+    if mode == "stream":
+        assert cancelled_stream.closed
+        assert len(cancelled_stream.chunks) == 1
+
+
+@pytest.mark.parametrize("mode", ["chat", "stream"])
+async def test_interruptible_http_sends_b_while_a_waits_and_silently_finishes_cancelled_a(
+    mode, capsys
+):
+    client = FakeClient()
+    session = QueuedSession()
+    started_a = asyncio.Event()
+    a_finished = asyncio.Event()
+    b_finished = asyncio.Event()
+    a_reply = asyncio.get_running_loop().create_future()
+    a_stream = QueuedStream(chunk("Aの途中経過\n\n", kind="progress"))
+
+    class FinalStream(FakeStream):
+        async def __aexit__(self, *args):
+            await super().__aexit__(*args)
+            b_finished.set()
+
+    async def create(**payload):
+        client.chat.completions.requests.append(payload)
+        text = payload["messages"][0]["content"]
+        if text == "A":
+            started_a.set()
+            if mode == "stream":
+                return a_stream
+            try:
+                return await a_reply
+            finally:
+                a_finished.set()
+        cancellation = {"kind": "cancel", "request_id": "req_a", "superseded_by": "req_b"}
+        if mode == "stream":
+            cancel_chunk = chunk(choices=False)
+            cancel_chunk.dots_bridge = cancellation
+            a_stream.queue.put_nowait(cancel_chunk)
+            return FinalStream([chunk("返信: B", kind="reply"), chunk(finish="stop")])
+        a_reply.set_result(SimpleNamespace(choices=[], dots_bridge=cancellation))
+        b_finished.set()
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="返信: B"))]
+        )
+
+    client.chat.completions.create = create
+    async with running_chat(client, session, mode=mode, interruptible=True) as task:
+        session.inputs.put_nowait("A")
+        await asyncio.wait_for(started_a.wait(), 1)
+        if mode == "stream":
+            await asyncio.wait_for(a_stream.waiting.wait(), 1)
+        session.inputs.put_nowait("B")
+        await asyncio.wait_for(b_finished.wait(), 1)
+        if mode == "stream":
+            await wait_until(lambda: a_stream.closed)
+        else:
+            await asyncio.wait_for(a_finished.wait(), 1)
+        session.inputs.put_nowait("/exit")
+        async with asyncio.timeout(1):
+            await task
+    output = capsys.readouterr().out
+    assert "dots> 返信: B" in output
+    assert output.count("dots> ") == 1
+    assert "system>" not in output
+    assert [request["messages"][0]["content"] for request in client.chat.completions.requests] == [
+        "A",
+        "B",
+    ]
+
+
+@pytest.mark.parametrize("mode", ["chat", "stream"])
+async def test_interruptible_http_exit_cancels_and_awaits_pending_request_cleanup(mode, capsys):
+    client = FakeClient()
+    session = QueuedSession()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+    stream = QueuedStream()
+
+    async def create(**payload):
+        client.chat.completions.requests.append(payload)
+        started.set()
+        if mode == "stream":
+            return stream
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    client.chat.completions.create = create
+    async with running_chat(client, session, mode=mode, interruptible=True) as task:
+        session.inputs.put_nowait("A")
+        await asyncio.wait_for(started.wait(), 1)
+        if mode == "stream":
+            await asyncio.wait_for(stream.waiting.wait(), 1)
+        session.inputs.put_nowait("/exit")
+        async with asyncio.timeout(1):
+            await task
+    assert stream.closed if mode == "stream" else cancelled.is_set()
+    assert len(client.chat.completions.requests) == 1
+    assert "system>" not in capsys.readouterr().out
+
+
 async def test_websocket_keeps_one_connection_and_one_reader_for_multiple_turns(capsys):
     client = FakeClient()
     connection = client.responses.connection
@@ -679,6 +833,98 @@ async def test_websocket_correlated_request_error_is_not_a_subscription_failure(
     assert "system>" in output
     assert "dots> 返信: next" in output
     assert len(client.responses.connects) == 1
+
+
+def cancelled_response(stream_id):
+    return {
+        "type": "response.completed",
+        "stream_id": stream_id,
+        "response": {
+            "status": "cancelled",
+            "output": [],
+            "metadata": {
+                "dots_bridge_kind": "cancel",
+                "dots_bridge_request_id": "req_a",
+                "dots_bridge_superseded_by": "req_b",
+            },
+        },
+    }
+
+
+async def test_serial_websocket_cancellation_is_silent_and_releases_next_turn(capsys):
+    connection = FakeConnection(event_overrides={"A": [cancelled_response("ignored")]})
+    client = FakeClient(connection=connection)
+    await example.run_chat(client, ScriptedSession("A", "B", "/exit"), mode="websocket")
+    output = capsys.readouterr().out
+    assert "dots> 返信: B" in output
+    assert output.count("dots> ") == 1
+    assert "system>" not in output
+    assert [request["input"] for request in connection.requests] == ["A", "B"]
+    assert connection.active_receivers == 0
+
+
+async def test_interruptible_websocket_sends_b_before_a_finishes_and_keeps_other_turns_alive(
+    capsys,
+):
+    connection = FakeConnection(auto_reply=False)
+    client = FakeClient(connection=connection)
+    session = QueuedSession()
+    async with running_chat(client, session, mode="websocket", interruptible=True) as task:
+        session.inputs.put_nowait("A")
+        await wait_until(lambda: len(connection.requests) == 1)
+        a_lane = connection.requests[0]["stream_id"]
+        connection.publish(*response_events("A", response_id="resp_a", stream_id=a_lane)[:5])
+        await wait_until(lambda: connection.incoming.empty())
+        session.inputs.put_nowait("B")
+        await wait_until(lambda: len(connection.requests) == 2)
+        b_lane = connection.requests[1]["stream_id"]
+        assert a_lane != b_lane
+        connection.publish(
+            cancelled_response(a_lane),
+            {"type": "error", "stream_id": a_lane, "error": {"message": "late cancelled error"}},
+            *response_events("B", response_id="resp_b", stream_id=b_lane),
+        )
+        await wait_until(lambda: connection.incoming.empty())
+        session.inputs.put_nowait("C")
+        await wait_until(lambda: len(connection.requests) == 3)
+        c_lane = connection.requests[2]["stream_id"]
+        connection.publish(*response_events("C", response_id="resp_c", stream_id=c_lane))
+        await wait_until(lambda: connection.incoming.empty())
+        session.inputs.put_nowait("/exit")
+        async with asyncio.timeout(1):
+            await task
+    output = capsys.readouterr().out
+    assert "progress> 進捗: A" in output
+    assert "dots> 返信: A" not in output
+    assert "dots> 返信: B" in output
+    assert "dots> 返信: C" in output
+    assert "system>" not in output
+    assert connection.max_receivers == 1
+    assert connection.active_receivers == 0
+    assert connection.closed
+
+
+async def test_interruptible_websocket_exit_awaits_all_pending_turn_waiters(capsys):
+    connection = FakeConnection(auto_reply=False)
+    client = FakeClient(connection=connection)
+    session = QueuedSession()
+    async with running_chat(client, session, mode="websocket", interruptible=True) as task:
+        session.inputs.put_nowait("A")
+        await wait_until(lambda: len(connection.requests) == 1)
+        session.inputs.put_nowait("B")
+        await wait_until(lambda: len(connection.requests) == 2)
+        session.inputs.put_nowait("/exit")
+        async with asyncio.timeout(1):
+            await task
+    assert connection.closed
+    assert connection.reader_cancelled
+    assert connection.active_receivers == 0
+    assert "system>" not in capsys.readouterr().out
+
+
+def test_interruptible_mode_requires_an_explicit_flag():
+    assert example.parser().parse_args([]).interruptible is False
+    assert example.parser().parse_args(["--interruptible"]).interruptible is True
 
 
 @pytest.mark.parametrize(

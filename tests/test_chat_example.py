@@ -123,6 +123,38 @@ async def test_chat_handles_multiple_sends_and_replies_in_one_process(capsys):
     assert not bridge.receiving
 
 
+async def test_direct_chat_silently_acknowledges_cancel_and_keeps_next_reply_visible(capsys):
+    class CancellingBridge(FakeBridge):
+        async def send_message(self, text, **options):
+            self.sent.append((text, options))
+            if text == "A":
+                message = ReceivedMessage(
+                    sequence=1,
+                    id="cancel_a",
+                    kind="cancel",
+                    request_id="req_a",
+                    channel="default",
+                    text="",
+                    metadata={},
+                    received_at="2026-10-22T00:00:00Z",
+                    superseded_by="req_b",
+                )
+                for handler in self.handlers:
+                    await handler(message)
+            else:
+                await self.deliver("Bの返信", request_id="req_b")
+            return {"request_id": "req_a" if text == "A" else "req_b"}
+
+    bridge = CancellingBridge()
+    await chat.run_chat(bridge, ScriptedSession("A", "B", "/exit"))
+    output = capsys.readouterr().out
+    assert "dots> Bの返信" in output
+    assert output.count("dots> ") == 1
+    assert "system>" not in output
+    assert [text for text, _ in bridge.sent] == ["A", "B"]
+    assert bridge.stop_count == 1
+
+
 async def test_chat_continues_send_example_checkpoint_without_replaying_processed_messages(
     tmp_path,
     capsys,

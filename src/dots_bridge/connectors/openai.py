@@ -26,7 +26,7 @@ from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route, WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
-from ..client import AsyncBridgeClient, ReplyTimeoutError, _positive
+from ..client import AsyncBridgeClient, ReplyTimeoutError, RequestCancelledError, _positive
 from ..errors import BridgeError
 from ..models import MessageInput
 from ._openai_protocol import (
@@ -331,6 +331,7 @@ def create_openai_connector(
     async def completions(request: Request):
         request_id = None
         started = time.monotonic()
+        created = int(time.time())
         protocol = "chat.completions"
         try:
             _authorize(request, api_key)
@@ -397,6 +398,27 @@ def create_openai_connector(
                 ),
                 headers={"X-Dots-Request-ID": request_id},
             )
+        except RequestCancelledError as error:
+            _log_lifecycle(
+                "request_cancelled",
+                protocol=protocol,
+                started=started,
+                reply_timeout=reply_timeout,
+                request_id=error.request_id,
+                code=error.code,
+            )
+            result = chat_completion(
+                "",
+                completion_id="chatcmpl-" + error.request_id,
+                created=created,
+                model=requested_model,
+            )
+            result["dots_bridge"] = {
+                "kind": "cancel",
+                "request_id": error.request_id,
+                "superseded_by": error.superseded_by,
+            }
+            return JSONResponse(result, headers={"X-Dots-Request-ID": error.request_id})
         except (ProtocolError, BridgeError, ReplyTimeoutError, httpx.HTTPError) as error:
             _log_failure(
                 error,
@@ -429,11 +451,16 @@ def create_openai_connector(
                         "invalid_response", "Response ended before a final reply.", 502
                     ) from None
                 _log_lifecycle(
-                    "final_received" if message.kind == "reply" else "progress_received",
+                    "request_cancelled"
+                    if message.kind == "cancel"
+                    else "final_received"
+                    if message.kind == "reply"
+                    else "progress_received",
                     protocol="chat.completions.stream",
                     started=started,
                     reply_timeout=reply_timeout,
                     request_id=request_id,
+                    code="request_cancelled" if message.kind == "cancel" else None,
                 )
                 text = message.text + ("\n\n" if message.kind == "progress" else "")
                 chunks = chat_chunks(
@@ -445,9 +472,12 @@ def create_openai_connector(
                     "request_id": message.request_id,
                     "message_id": message.id,
                     "sequence": message.sequence,
+                    **(
+                        {"superseded_by": message.superseded_by} if message.kind == "cancel" else {}
+                    ),
                 }
                 yield "data: " + _json(chunk) + "\n\n"
-                if message.kind == "reply":
+                if message.kind in {"reply", "cancel"}:
                     yield "data: " + _json(chunks[2]) + "\n\n"
                     break
                 task = asyncio.create_task(anext(messages))
@@ -499,12 +529,13 @@ def create_openai_connector(
             consumer_registry=push_consumers,
         )
 
-        async def run_response(payload):
-            started = time.monotonic()
-            requested_model = _model(payload, model)
+        async def run_response(job):
+            started = job["started"]
+            requested_model = job["model"]
+            request_id = job["request_id"]
             response_id = "resp_" + uuid.uuid4().hex
-            created = int(time.time())
-            stream_id = payload.get("stream_id")
+            created = job["created"]
+            stream_id = job["stream_id"]
             event_stream = ResponseEventStream(
                 **{
                     "response_id": response_id,
@@ -515,39 +546,50 @@ def create_openai_connector(
             )
             for event in event_stream.start():
                 await send_event(event)
-            request_id = None
             try:
-                request_id = await enqueue(
-                    latest_response_text(payload), requested_model, "responses.websocket"
-                )
-                _log_lifecycle(
-                    "request_accepted",
-                    protocol="responses.websocket",
-                    started=started,
-                    reply_timeout=reply_timeout,
-                    request_id=request_id,
-                )
-                messages = bridge_client.iter_responses(request_id, timeout=reply_timeout)
+                remaining = started + reply_timeout - time.monotonic()
+                if remaining <= 0:
+                    raise ReplyTimeoutError(request_id)
+                messages = bridge_client.iter_responses(request_id, timeout=remaining)
                 try:
-                    final_received = False
+                    terminal_received = False
                     async for message in messages:
-                        final_received = message.kind == "reply"
+                        terminal_received = message.kind in {"reply", "cancel"}
                         _log_lifecycle(
-                            "final_received" if final_received else "progress_received",
+                            "request_cancelled"
+                            if message.kind == "cancel"
+                            else "final_received"
+                            if message.kind == "reply"
+                            else "progress_received",
                             protocol="responses.websocket",
                             started=started,
                             reply_timeout=reply_timeout,
                             request_id=request_id,
+                            code="request_cancelled" if message.kind == "cancel" else None,
                         )
-                        for event in event_stream.message(
-                            message.text,
-                            final=final_received,
-                            metadata={"dots_bridge_request_id": request_id},
-                        ):
+                        if message.kind == "cancel":
+                            events = event_stream.cancel(
+                                metadata={
+                                    "dots_bridge_kind": "cancel",
+                                    "dots_bridge_request_id": request_id,
+                                    **(
+                                        {"dots_bridge_superseded_by": message.superseded_by}
+                                        if message.superseded_by is not None
+                                        else {}
+                                    ),
+                                }
+                            )
+                        else:
+                            events = event_stream.message(
+                                message.text,
+                                final=message.kind == "reply",
+                                metadata={"dots_bridge_request_id": request_id},
+                            )
+                        for event in events:
                             await send_event(event)
-                    if not final_received:
+                    if not terminal_received:
                         raise BridgeError(
-                            "invalid_response", "Response ended before a final reply.", 502
+                            "invalid_response", "Response ended before a terminal response.", 502
                         )
                 finally:
                     with CancelScope(shield=True):
@@ -571,8 +613,8 @@ def create_openai_connector(
 
         async def worker():
             while True:
-                payload = await queue.get()
-                await run_response(payload)
+                job = await queue.get()
+                await run_response(job)
 
         worker_task = asyncio.create_task(worker(), name="dots-bridge-openai-websocket")
         receive_task = None
@@ -607,8 +649,8 @@ def create_openai_connector(
                             param="type",
                         )
                     _options(payload, websocket=True)
-                    _model(payload, model)
-                    latest_response_text(payload)
+                    requested_model = _model(payload, model)
+                    text = latest_response_text(payload)
                     stream_id = payload.get("stream_id")
                     if stream_id is not None and (
                         not isinstance(stream_id, str)
@@ -619,14 +661,31 @@ def create_openai_connector(
                             "hyphens, or periods.",
                             param="stream_id",
                         )
-                    try:
-                        queue.put_nowait(payload)
-                    except asyncio.QueueFull:
+                    if queue.full():
                         raise ProtocolError(
                             "Too many queued responses on this connection.",
                             status_code=429,
                             code="rate_limit_exceeded",
-                        ) from None
+                        )
+                    # A new request must reach dots while an older response is
+                    # still running, so dots can supersede it. Only output is FIFO.
+                    request_id = await enqueue(text, requested_model, "responses.websocket")
+                    _log_lifecycle(
+                        "request_accepted",
+                        protocol="responses.websocket",
+                        started=started,
+                        reply_timeout=reply_timeout,
+                        request_id=request_id,
+                    )
+                    queue.put_nowait(
+                        {
+                            "request_id": request_id,
+                            "model": requested_model,
+                            "started": started,
+                            "created": int(time.time()),
+                            "stream_id": stream_id,
+                        }
+                    )
                 except (ProtocolError, BridgeError, httpx.HTTPError) as error:
                     status, body = _log_failure(
                         error,

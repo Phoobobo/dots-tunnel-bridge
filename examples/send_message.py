@@ -11,6 +11,8 @@ async def main():
 
         @bridge.on_received
         async def received(message: ReceivedMessage):
+            if message.kind == "cancel":
+                return
             # Replace this with your application logic. id is stable across retries.
             print(message.kind, message.request_id, message.text)
 

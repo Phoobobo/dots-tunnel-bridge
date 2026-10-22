@@ -276,7 +276,7 @@ class WebSocketPushSession:
                 return False
             if message.sequence <= self._cursor:
                 continue
-            if message.kind in {"progress", "reply"}:
+            if message.kind in {"progress", "reply", "cancel"}:
                 async with self._lock:
                     # Receipt order plus one pending push prevents a reply ACK
                     # from skipping any unacknowledged push in this consumer.

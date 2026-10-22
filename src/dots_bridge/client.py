@@ -28,6 +28,15 @@ class ReplyTimeoutError(TimeoutError):
         )
 
 
+class RequestCancelledError(BridgeError):
+    """The request ended without a reply, optionally superseded by a newer request."""
+
+    def __init__(self, request_id: str, superseded_by: str | None = None) -> None:
+        self.request_id = request_id
+        self.superseded_by = superseded_by
+        super().__init__("request_cancelled", "This request was cancelled.", 409)
+
+
 def _positive(value: float, name: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a positive finite number")
@@ -105,7 +114,10 @@ def _subscriptions(body: dict[str, Any]) -> list[dict[str, Any]]:
 def _response_messages(body: dict[str, Any], request_id: str) -> list[ReceivedMessage]:
     messages = _received(body.get("messages"))
     if any(
-        message.request_id != request_id or message.kind not in {"progress", "reply"}
+        message.request_id != request_id
+        or message.kind not in {"progress", "reply", "cancel"}
+        or message.kind == "cancel"
+        and message.text != ""
         for message in messages
     ):
         raise BridgeError(
@@ -141,12 +153,28 @@ async def _response_before_deadline(
     return result
 
 
-def _has_reply(message: dict[str, Any]) -> bool:
+def _has_reply(message: dict[str, Any], request_id: str | None = None) -> bool:
     if message.get("reply_status") == "replied" and isinstance(message.get("reply"), str):
         return True
     if message.get("reply_status") == "expired":
         raise BridgeError("reply_expired", "This request's reply window has expired.", 410)
     if message.get("reply_status") == "cancelled":
+        if "superseded_by" in message:
+            identity = message.get("request_id", request_id)
+            superseded_by = message["superseded_by"]
+            if (
+                not isinstance(identity, str)
+                or not identity
+                or (request_id is not None and identity != request_id)
+                or (
+                    superseded_by is not None
+                    and (not isinstance(superseded_by, str) or not superseded_by.strip())
+                )
+            ):
+                raise BridgeError(
+                    "invalid_response", "Bridge returned an invalid cancellation.", 502
+                )
+            raise RequestCancelledError(identity, superseded_by)
         raise BridgeError("reply_cancelled", "Replies to this request have been cancelled.", 409)
     delivery = message.get("delivery_status")
     if delivery in {"failed", "cancelled"}:
@@ -294,7 +322,7 @@ class BridgeClient:
                 raise
             if time.monotonic() >= deadline:
                 raise ReplyTimeoutError(request_id)
-            if _has_reply(message):
+            if _has_reply(message, request_id):
                 return message
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -469,7 +497,7 @@ class AsyncBridgeClient:
         timeout: float = 120,  # noqa: ASYNC109 - Fixed deadline bounds each network await.
         poll_interval: float = 0.5,
     ) -> AsyncIterator[ReceivedMessage]:
-        """Yield ordered progress receipts, then the final reply, without resending.
+        """Yield ordered progress followed by one final reply or cancellation.
 
         Stored progress is replayed before checking terminal request status.
         Receipt sequences deduplicate overlapping pages. ``timeout`` covers the
@@ -480,7 +508,7 @@ class AsyncBridgeClient:
         interval = _positive(poll_interval, "poll_interval")
         deadline = time.monotonic() + duration
         cursor = 0
-        final_required = False
+        terminal_required = False
         while True:
             messages = await _response_before_deadline(
                 request_id,
@@ -496,23 +524,28 @@ class AsyncBridgeClient:
                 _response_remaining(request_id, deadline)
                 cursor = message.sequence
                 yield message
-                if message.kind == "reply":
+                if message.kind in {"reply", "cancel"}:
                     return
             if len(messages) >= 100 and cursor > previous_cursor:
                 continue  # Drain all available pages before consulting final status.
-            if final_required:
+            if terminal_required:
                 raise BridgeError(
                     "invalid_response",
-                    "Bridge reported a final reply without its response receipt.",
+                    "Bridge reported a terminal response without its response receipt.",
                     502,
                 )
             status = await _response_before_deadline(
                 request_id, deadline, lambda: self.get_message(request_id)
             )
-            if _has_reply(status):
+            try:
+                has_reply = _has_reply(status, request_id)
+            except RequestCancelledError:
+                terminal_required = True
+                continue
+            if has_reply:
                 # A reply may have committed between the page and status reads.
                 # Its receipt must now appear; drain any intervening full pages.
-                final_required = True
+                terminal_required = True
                 continue
             if status.get("reply_status") == "replied":
                 raise BridgeError(
@@ -556,7 +589,7 @@ class AsyncBridgeClient:
                 if time.monotonic() >= deadline:
                     raise ReplyTimeoutError(request_id) from None
                 raise
-            if _has_reply(message):
+            if _has_reply(message, request_id):
                 return message
             remaining = deadline - time.monotonic()
             if remaining <= 0:

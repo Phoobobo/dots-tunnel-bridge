@@ -22,17 +22,18 @@ T = TypeVar("T")
 RECEIVED_TABLE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS received_messages (
     sequence INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE NOT NULL,
-    kind TEXT NOT NULL CHECK(kind IN ('reply', 'progress', 'push')), request_id TEXT,
+    kind TEXT NOT NULL CHECK(kind IN ('reply', 'progress', 'push', 'cancel')), request_id TEXT,
     channel TEXT NOT NULL, text TEXT NOT NULL, metadata TEXT NOT NULL,
-    received_at REAL NOT NULL, idempotency_key TEXT, fingerprint TEXT NOT NULL
+    received_at REAL NOT NULL, idempotency_key TEXT, fingerprint TEXT NOT NULL,
+    superseded_by TEXT
 );
 """
 
 RECEIVED_INDEX_SCHEMA = """
 CREATE INDEX IF NOT EXISTS received_messages_channel ON received_messages(channel, sequence);
 CREATE INDEX IF NOT EXISTS received_messages_request ON received_messages(request_id, sequence);
-CREATE UNIQUE INDEX IF NOT EXISTS received_messages_reply ON received_messages(request_id)
-    WHERE kind='reply';
+CREATE UNIQUE INDEX IF NOT EXISTS received_messages_terminal ON received_messages(request_id)
+    WHERE kind IN ('reply', 'cancel');
 CREATE UNIQUE INDEX IF NOT EXISTS received_messages_push_key ON received_messages(idempotency_key)
     WHERE kind='push';
 CREATE UNIQUE INDEX IF NOT EXISTS received_messages_progress_key
@@ -53,7 +54,7 @@ CREATE TABLE IF NOT EXISTS messages (
     next_attempt_at REAL NOT NULL, lease_until REAL, status_code INTEGER, error TEXT,
     reply TEXT, replied_at REAL, reply_cancelled INTEGER NOT NULL DEFAULT 0,
     idempotency_key TEXT UNIQUE, fingerprint TEXT NOT NULL,
-    event TEXT NOT NULL
+    event TEXT NOT NULL, superseded_by TEXT, cancelled_at REAL
 );
 CREATE INDEX IF NOT EXISTS messages_pending ON messages(delivery_status, next_attempt_at);
 CREATE TABLE IF NOT EXISTS received_consumers (
@@ -109,14 +110,22 @@ class Store:
 
     @staticmethod
     def _migrate_received_messages(db: sqlite3.Connection) -> None:
-        # Rebuilding removes schema 3's request-wide uniqueness while preserving
+        # Rebuild older CHECK constraints and uniqueness rules while preserving
         # all public receipt identities and the AUTOINCREMENT high-water mark.
         sequence = db.execute(
             "SELECT seq FROM sqlite_sequence WHERE name='received_messages'"
         ).fetchone()
+        columns = {row[1] for row in db.execute("PRAGMA table_info(received_messages)")}
         db.execute("ALTER TABLE received_messages RENAME TO received_messages_legacy")
         db.execute(RECEIVED_TABLE_SCHEMA)
-        db.execute("INSERT INTO received_messages SELECT * FROM received_messages_legacy")
+        replacement = "superseded_by" if "superseded_by" in columns else "NULL"
+        db.execute(
+            "INSERT INTO received_messages "
+            "(sequence, id, kind, request_id, channel, text, metadata, received_at, "
+            "idempotency_key, fingerprint, superseded_by) "
+            "SELECT sequence, id, kind, request_id, channel, text, metadata, received_at, "
+            f"idempotency_key, fingerprint, {replacement} FROM received_messages_legacy"
+        )
         db.execute("DROP TABLE received_messages_legacy")
         if sequence:
             updated = db.execute(
@@ -146,7 +155,7 @@ class Store:
                     if statement.strip():
                         db.execute(statement)
                 version = db.execute("SELECT value FROM bridge_meta WHERE key='schema'").fetchone()
-                if version and version[0] not in (b"1", b"2", b"3", b"4"):
+                if version and version[0] not in (b"1", b"2", b"3", b"4", b"5"):
                     raise BridgeError(
                         "storage_version", "Unsupported database schema version.", 500
                     )
@@ -157,6 +166,10 @@ class Store:
                             "ALTER TABLE messages ADD COLUMN "
                             "reply_cancelled INTEGER NOT NULL DEFAULT 0"
                         )
+                columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
+                for name, column_type in (("superseded_by", "TEXT"), ("cancelled_at", "REAL")):
+                    if name not in columns:
+                        db.execute(f"ALTER TABLE messages ADD COLUMN {name} {column_type}")
                 check = db.execute("SELECT value FROM bridge_meta WHERE key='key_check'").fetchone()
                 if check:
                     try:
@@ -173,7 +186,7 @@ class Store:
                         "INSERT INTO bridge_meta VALUES ('key_check', ?)",
                         (self.cipher.encrypt(b"dots-bridge"),),
                     )
-                if had_received and (not version or version[0] != b"4"):
+                if had_received and (not version or version[0] != b"5"):
                     self._migrate_received_messages(db)
                 else:
                     db.execute(RECEIVED_TABLE_SCHEMA)
@@ -193,7 +206,7 @@ class Store:
                 db.execute(
                     "INSERT INTO bridge_meta VALUES ('schema', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (b"4",),
+                    (b"5",),
                 )
 
             await self.run(setup)
@@ -364,6 +377,10 @@ class Store:
 
     @staticmethod
     def _require_active_request(db: sqlite3.Connection, row: sqlite3.Row) -> None:
+        if row["superseded_by"] is not None:
+            raise BridgeError(
+                "message_inactive", "This request was replaced by a newer request.", 409
+            )
         if row["expires_at"] <= time.time():
             raise BridgeError("reply_expired", "The reply deadline has passed.", 410)
         sub = db.execute(
@@ -422,6 +439,90 @@ class Store:
             )
 
         return await self.run(save)
+
+    async def cancel_request(self, request_id: str, *, superseded_by: str) -> dict:
+        def cancel(db):
+            db.execute("BEGIN IMMEDIATE")
+            request = db.execute(
+                "SELECT rowid AS creation_order, * FROM messages WHERE request_id=?", (request_id,)
+            ).fetchone()
+            if not request:
+                raise BridgeError("message_not_found", "No matching message.", 404)
+            existing = db.execute(
+                "SELECT * FROM received_messages WHERE kind='cancel' AND request_id=?",
+                (request_id,),
+            ).fetchone()
+            if existing:
+                if existing["superseded_by"] != superseded_by:
+                    raise BridgeError(
+                        "cancellation_conflict",
+                        "This request already has a different replacement.",
+                        409,
+                    )
+                return public_received(dict(existing))
+            if request["reply"] is not None:
+                raise BridgeError("reply_completed", "This request already has a final reply.", 409)
+            self._require_active_request(db, request)
+            if request_id == superseded_by:
+                raise BridgeError("invalid_replacement", "A request cannot replace itself.", 409)
+            replacement = db.execute(
+                "SELECT rowid AS creation_order, * FROM messages WHERE request_id=?",
+                (superseded_by,),
+            ).fetchone()
+            if not replacement:
+                raise BridgeError(
+                    "replacement_not_found", "The replacement request does not exist.", 404
+                )
+            if (
+                replacement["channel"] != request["channel"]
+                or replacement["subscription_id"] != request["subscription_id"]
+                or (replacement["created_at"], replacement["creation_order"])
+                <= (request["created_at"], request["creation_order"])
+            ):
+                raise BridgeError(
+                    "invalid_replacement",
+                    "The replacement must be newer and use the same channel and subscription.",
+                    409,
+                )
+            try:
+                self._require_active_request(db, replacement)
+            except BridgeError:
+                raise BridgeError(
+                    "invalid_replacement", "The replacement request is no longer active.", 409
+                ) from None
+            now = time.time()
+            db.execute(
+                "UPDATE messages SET reply_cancelled=1, superseded_by=?, cancelled_at=?, "
+                "error=CASE WHEN delivery_status IN ('queued','delivering') "
+                "THEN 'request_superseded' ELSE error END, "
+                "delivery_status=CASE WHEN delivery_status IN ('queued','delivering') "
+                "THEN 'cancelled' ELSE delivery_status END, lease_until=NULL WHERE request_id=?",
+                (superseded_by, now, request_id),
+            )
+            message_id = str(uuid4())
+            db.execute(
+                "INSERT INTO received_messages "
+                "(id, kind, request_id, channel, text, metadata, received_at, fingerprint, "
+                "superseded_by) VALUES (?, 'cancel', ?, ?, '', ?, ?, ?, ?)",
+                (
+                    message_id,
+                    request_id,
+                    request["channel"],
+                    request["metadata"],
+                    now,
+                    request["fingerprint"],
+                    superseded_by,
+                ),
+            )
+            return public_received(
+                dict(
+                    db.execute(
+                        "SELECT * FROM received_messages WHERE id=?", (message_id,)
+                    ).fetchone()
+                )
+            )
+
+        return await self.run(cancel)
 
     @staticmethod
     def _append_reply(db: sqlite3.Connection, row: sqlite3.Row):
@@ -519,7 +620,8 @@ class Store:
                 public_received(dict(row))
                 for row in db.execute(
                     "SELECT * FROM received_messages WHERE request_id=? "
-                    "AND kind IN ('progress', 'reply') AND sequence>? ORDER BY sequence LIMIT ?",
+                    "AND kind IN ('progress', 'reply', 'cancel') AND sequence>? "
+                    "ORDER BY sequence LIMIT ?",
                     (request_id, after, limit),
                 )
             ]
@@ -660,7 +762,7 @@ class Store:
 
 def public_message(row: dict) -> dict[str, Any]:
     replied = row["reply"] is not None
-    return {
+    result = {
         "request_id": row["request_id"],
         "event_id": row["event_id"],
         "subscription_id": row["subscription_id"],
@@ -683,10 +785,16 @@ def public_message(row: dict) -> dict[str, Any]:
         "reply": row["reply"],
         "replied_at": iso8601(row["replied_at"]) if row["replied_at"] else None,
     }
+    if row.get("superseded_by") is not None:
+        result["superseded_by"] = row["superseded_by"]
+        result["cancelled_at"] = (
+            iso8601(row["cancelled_at"]) if row["cancelled_at"] is not None else None
+        )
+    return result
 
 
 def public_received(row: dict) -> dict[str, Any]:
-    return {
+    result = {
         "sequence": row["sequence"],
         "id": row["id"],
         "kind": row["kind"],
@@ -696,3 +804,6 @@ def public_received(row: dict) -> dict[str, Any]:
         "metadata": json.loads(row["metadata"]),
         "received_at": iso8601(row["received_at"]),
     }
+    if row["kind"] == "cancel":
+        result["superseded_by"] = row["superseded_by"]
+    return result

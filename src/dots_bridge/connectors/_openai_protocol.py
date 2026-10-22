@@ -420,3 +420,18 @@ class ResponseEventStream:
                 }
             ]
         )
+
+    def cancel(self, *, metadata: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Complete a cancelled request and discard its temporary output state."""
+        if self._finished:
+            raise ValueError("Response is already finished")
+        self._finished = True
+        self._output.clear()
+        return self._number(
+            [
+                {
+                    "type": "response.completed",
+                    "response": self._response(status="cancelled", metadata=metadata),
+                }
+            ]
+        )

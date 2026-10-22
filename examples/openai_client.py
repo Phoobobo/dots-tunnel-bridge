@@ -36,6 +36,11 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--url", default="http://127.0.0.1:8766/v1")
     command.add_argument("--mode", choices=["chat", "stream", "websocket"], default="chat")
     command.add_argument(
+        "--interruptible",
+        action="store_true",
+        help="Accept another input while waiting for earlier replies",
+    )
+    command.add_argument(
         "--timeout", type=_timeout, default=660.0, help="Client timeout seconds (default: 660)"
     )
     command.add_argument(
@@ -83,6 +88,10 @@ class _TextOutput:
     def finish(self):
         if self.key is not None and not self.newline:
             print(flush=True)
+        self.key = None
+        self.newline = True
+
+    def discard(self):
         self.key = None
         self.newline = True
 
@@ -164,49 +173,96 @@ def _report_event_error(event, *, elapsed=None):
     )
 
 
-async def _http_chat(client, session, *, stream, initial_text):
+async def _http_turn(client, text, *, stream):
     output = _TextOutput()
-    async for text in _inputs(session, initial_text):
-        started = time.monotonic()
-        request_id = None
-        try:
-            # The dot owns the conversation context; only send the latest input.
-            arguments = {"model": "dots", "messages": [{"role": "user", "content": text}]}
-            if stream:
-                async with await client.chat.completions.create(**arguments, stream=True) as chunks:
-                    request_id = _request_id(getattr(chunks, "response", None))
-                    async for chunk in chunks:
-                        if not chunk.choices:
-                            continue
-                        metadata = getattr(chunk, "dots_bridge", None) or {}
-                        request_id = _field(metadata.get("request_id")) or request_id
-                        kind = metadata.get("kind", "reply")
-                        output.write(
-                            chunk.choices[0].delta.content or "",
-                            key=metadata.get("message_id") or kind,
-                            label="progress" if kind == "progress" else "dots",
-                        )
+    started = time.monotonic()
+    request_id = None
+    cancelled = False
+    try:
+        # The dot owns the conversation context; only send the latest input.
+        arguments = {"model": "dots", "messages": [{"role": "user", "content": text}]}
+        if stream:
+            async with await client.chat.completions.create(**arguments, stream=True) as chunks:
+                request_id = _request_id(getattr(chunks, "response", None))
+                async for chunk in chunks:
+                    metadata = getattr(chunk, "dots_bridge", None) or {}
+                    request_id = _field(metadata.get("request_id")) or request_id
+                    kind = metadata.get("kind", "reply")
+                    if kind == "cancel":
+                        cancelled = True
+                        output.discard()
+                        break
+                    if not chunk.choices:
+                        continue
+                    output.write(
+                        chunk.choices[0].delta.content or "",
+                        key=metadata.get("message_id") or kind,
+                        label="progress" if kind == "progress" else "dots",
+                    )
+        else:
+            result = await client.chat.completions.create(**arguments)
+            if (getattr(result, "dots_bridge", None) or {}).get("kind") == "cancel":
+                cancelled = True
             else:
-                result = await client.chat.completions.create(**arguments)
                 print(f"dots> {result.choices[0].message.content or ''}", flush=True)
-        except Exception as error:
+    except Exception as error:
+        if not cancelled:
             output.finish()
             # A timeout may happen after enqueueing. Leave retries to the user.
             _report_exception(error, elapsed=time.monotonic() - started, request_id=request_id)
-        finally:
+    finally:
+        if cancelled:
+            output.discard()
+        else:
             output.finish()
 
 
-async def _websocket_chat(client, session, *, initial_text, consumer_id, reply_timeout):
+async def _http_chat(client, session, *, stream, initial_text, interruptible):
+    tasks = set()
+    try:
+        async for text in _inputs(session, initial_text):
+            if not interruptible:
+                await _http_turn(client, text, stream=stream)
+                continue
+            task = asyncio.create_task(_http_turn(client, text, stream=stream))
+            tasks.add(task)
+            task.add_done_callback(tasks.discard)
+            # Start the request even when an injected input source is already ready.
+            await asyncio.sleep(0)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class _PendingResponse:
+    def __init__(self):
+        self.completed = asyncio.Event()
+        self.output = _TextOutput()
+        self.phases = {}
+        self.started = time.monotonic()
+        self.cancelled = False
+
+
+async def _websocket_chat(
+    client, session, *, initial_text, consumer_id, reply_timeout, interruptible
+):
     async with client.responses.connect(max_retries=0) as connection:
         # Use one raw reader: dots.* are connector extensions, outside SDK event types.
         await connection.send({"type": "dots.subscribe", "consumer_id": consumer_id})
         ready = asyncio.Event()
-        completed = asyncio.Event()
-        output = _TextOutput()
-        phases = {}
-        pending_stream = None
-        started = None
+        pending = {}
+        retired = set()
+        waiters = set()
+
+        def response_for(event):
+            stream_id = event.get("stream_id")
+            if stream_id in pending:
+                return pending[stream_id]
+            # Serial mode also accepts older connectors without lane metadata.
+            if stream_id is None and not interruptible and len(pending) == 1:
+                return next(iter(pending.values()))
+            return None
 
         async def receive():
             while True:
@@ -214,71 +270,112 @@ async def _websocket_chat(client, session, *, initial_text, consumer_id, reply_t
                 event_type = event["type"]
                 if event_type == "dots.subscribed":
                     ready.set()
+                    continue
                 elif event_type == "dots.push":
                     message = event["message"]
-                    output.finish()
+                    for response in pending.values():
+                        response.output.finish()
                     print(f"push> {message['text']}", flush=True)
                     # Display is this demo's processing step. In an application,
                     # acknowledge only after your own ingestion has succeeded.
                     await connection.send({"type": "dots.push.ack", "message_id": message["id"]})
-                elif event_type == "response.output_item.added":
+                    continue
+                else:
+                    if event.get("stream_id") in retired:
+                        continue
+                    response = response_for(event)
+                    if response is not None and response.completed.is_set():
+                        continue
+                    if event_type == "error":
+                        if response is not None:
+                            response.output.finish()
+                        _report_event_error(
+                            event,
+                            elapsed=time.monotonic() - response.started if response else None,
+                        )
+                        if response is None:
+                            raise RuntimeError("WebSocketの購読・受信に失敗しました。")
+                        response.phases.clear()
+                        response.completed.set()
+                        continue
+                    if response is None:
+                        continue
+                if event_type == "response.output_item.added":
                     item = event["item"]
-                    phases[item["id"]] = item.get("phase")
+                    response.phases[item["id"]] = item.get("phase")
                 elif event_type == "response.output_text.delta":
                     item_id = event["item_id"]
-                    output.write(
+                    response.output.write(
                         event["delta"],
                         key=item_id,
-                        label="progress" if phases.get(item_id) == "commentary" else "dots",
+                        label="progress"
+                        if response.phases.get(item_id) == "commentary"
+                        else "dots",
                     )
                 elif event_type == "response.output_text.done":
-                    output.finish()
+                    response.output.finish()
                 elif event_type in {"response.completed", "response.failed", "response.incomplete"}:
-                    output.finish()
-                    phases.clear()
-                    if event_type != "response.completed":
-                        _report_event_error(
-                            event, elapsed=time.monotonic() - started if started else None
-                        )
-                    completed.set()
-                elif event_type == "error":
-                    output.finish()
-                    _report_event_error(
-                        event, elapsed=time.monotonic() - started if started else None
+                    wire_response = event.get("response") or {}
+                    metadata = wire_response.get("metadata") or {}
+                    response.cancelled = (
+                        metadata.get("dots_bridge_kind") == "cancel"
+                        or wire_response.get("status") == "cancelled"
                     )
-                    # Correlate request errors separately from push/subscription failures.
-                    if pending_stream is None or event.get("stream_id") != pending_stream:
-                        raise RuntimeError("WebSocketの購読・受信に失敗しました。")
-                    phases.clear()
-                    completed.set()
+                    if response.cancelled:
+                        response.output.discard()
+                    else:
+                        response.output.finish()
+                    response.phases.clear()
+                    if not response.cancelled and event_type != "response.completed":
+                        _report_event_error(event, elapsed=time.monotonic() - response.started)
+                    response.completed.set()
+
+        async def wait_response(stream_id, response):
+            try:
+                async with asyncio.timeout(reply_timeout):
+                    await response.completed.wait()
+            except TimeoutError:
+                response.output.finish()
+                _report_error(
+                    "TimeoutError",
+                    details={
+                        "code": "client_reply_timeout",
+                        "message": "WebSocketの応答待ち期限を超えました。"
+                        "--timeout で延長できます。依頼は取り消されていません。",
+                    },
+                    elapsed=time.monotonic() - response.started,
+                )
+                if not interruptible:
+                    raise
+            finally:
+                pending.pop(stream_id, None)
+                retired.add(stream_id)
+                if response.cancelled:
+                    response.output.discard()
+                else:
+                    response.output.finish()
 
         async def send():
-            nonlocal pending_stream, started
             async with asyncio.timeout(30):
                 await ready.wait()
             turn = 0
             async for text in _inputs(session, initial_text):
                 turn += 1
-                pending_stream = f"turn_{turn}"
-                started = time.monotonic()
-                completed.clear()
-                await connection.response.create(model="dots", input=text, stream_id=pending_stream)
+                stream_id = f"turn_{turn}"
+                response = _PendingResponse()
+                pending[stream_id] = response
                 try:
-                    async with asyncio.timeout(reply_timeout):
-                        await completed.wait()
-                except TimeoutError:
-                    _report_error(
-                        "TimeoutError",
-                        details={
-                            "code": "client_reply_timeout",
-                            "message": "WebSocketの応答待ち期限を超えました。"
-                            "--timeout で延長できます。依頼は取り消されていません。",
-                        },
-                        elapsed=time.monotonic() - started,
-                    )
+                    await connection.response.create(model="dots", input=text, stream_id=stream_id)
+                except BaseException:
+                    pending.pop(stream_id, None)
+                    response.output.discard()
                     raise
-                pending_stream = None
-                started = None
+                if interruptible:
+                    waiter = asyncio.create_task(wait_response(stream_id, response))
+                    waiters.add(waiter)
+                    waiter.add_done_callback(waiters.discard)
+                else:
+                    await wait_response(stream_id, response)
 
         tasks = [asyncio.create_task(receive()), asyncio.create_task(send())]
         try:
@@ -287,10 +384,15 @@ async def _websocket_chat(client, session, *, initial_text, consumer_id, reply_t
                 if task in done:
                     await task
         finally:
-            for task in tasks:
+            cleanup = [*tasks, *waiters]
+            for task in cleanup:
                 task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            output.finish()
+            await asyncio.gather(*cleanup, return_exceptions=True)
+            for response in pending.values():
+                response.output.discard()
+                response.phases.clear()
+            pending.clear()
+            retired.clear()
 
 
 async def run_chat(
@@ -301,6 +403,7 @@ async def run_chat(
     initial_text=None,
     consumer_id="example-openai",
     timeout=660,  # noqa: ASYNC109 - Forwarded to the WebSocket turn deadline.
+    interruptible=False,
 ):
     print("Enterで送信、/exit・/quit・Ctrl+C・Ctrl+Dで終了します。", flush=True)
     if mode == "websocket":
@@ -311,9 +414,16 @@ async def run_chat(
             initial_text=initial_text,
             consumer_id=consumer_id,
             reply_timeout=timeout,
+            interruptible=interruptible,
         )
     else:
-        await _http_chat(client, session, stream=mode == "stream", initial_text=initial_text)
+        await _http_chat(
+            client,
+            session,
+            stream=mode == "stream",
+            initial_text=initial_text,
+            interruptible=interruptible,
+        )
 
 
 async def main(args):
@@ -343,6 +453,7 @@ async def main(args):
                 initial_text=args.text,
                 consumer_id=args.consumer_id,
                 timeout=args.timeout,
+                interruptible=args.interruptible,
             )
 
 

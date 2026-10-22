@@ -41,6 +41,8 @@ class BridgeBackend(Protocol):
         self, request_id: str, text: str, *, idempotency_key: str
     ) -> dict[str, Any]: ...
 
+    async def cancel_request(self, request_id: str, *, superseded_by: str) -> dict[str, Any]: ...
+
     async def send_to_app(
         self,
         text: str,
@@ -179,7 +181,7 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
     """Build the MCP endpoint used by dots, with draft webhook Events support."""
     mcp = FastMCP(
         "dots-bridge",
-        version="0.2.0",
+        version="0.6.0",
         auth=auth,
         instructions=(
             "This bridge connects its owner's application to this dot. Subscribe to "
@@ -193,6 +195,12 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
             "idempotency_key; reuse that key only when retrying the same update. "
             "Progress does not complete the request: always use reply_to_app for "
             "the final response. "
+            "Only when a later request clearly replaces an unfinished earlier request, "
+            "call cancel_request with the obsolete request_id and the newer request's ID "
+            "as superseded_by. Never cancel independent requests. Normal completion, "
+            "including a conclusion that no action is needed, still requires reply_to_app. "
+            "Always send a final reply for the latest active request. Cancellation closes "
+            "the bridge request; it does not forcibly interrupt this dot's execution. "
             "When the owner authorizes proactive messages, call send_to_app to "
             "send application messages without a prior request or subscription. "
             "Use reply_to_app for responses to application requests so they remain "
@@ -285,6 +293,35 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
         """
         try:
             return await bridge.report_progress(request_id, text, idempotency_key=idempotency_key)
+        except BridgeError as exc:
+            raise ToolError(f"{exc.code}: {exc.message}") from None
+
+    @mcp.tool(
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": False,
+        },
+        auth=reply_auth,
+        meta=_security_meta("messages:reply"),
+    )
+    async def cancel_request(
+        request_id: Annotated[str, Field(min_length=1, max_length=200)],
+        superseded_by: Annotated[str, Field(min_length=1, max_length=200)],
+    ) -> dict[str, Any]:
+        """Cancel an obsolete unfinished request clearly replaced by a newer request.
+
+        superseded_by must name a real, newer request for the same channel and
+        subscription. Do not cancel independent requests. For normal completion
+        or a conclusion that nothing needs doing, use reply_to_app instead.
+        Always provide a final reply for the latest active request. Repeating the
+        same request_id and superseded_by is idempotent; another replacement is
+        rejected. This marks the bridge request as cancelled and does not forcibly
+        interrupt dots execution.
+        """
+        try:
+            return await bridge.cancel_request(request_id, superseded_by=superseded_by)
         except BridgeError as exc:
             raise ToolError(f"{exc.code}: {exc.message}") from None
 

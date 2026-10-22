@@ -2,18 +2,19 @@
 
 from .app import create_app
 from .bridge import DotsBridge
-from .client import AsyncBridgeClient, BridgeClient, ReplyTimeoutError
+from .client import AsyncBridgeClient, BridgeClient, ReplyTimeoutError, RequestCancelledError
 from .config import Settings
 from .errors import BridgeError
 from .models import ReceivedMessage
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 __all__ = [
     "AsyncBridgeClient",
     "BridgeClient",
     "BridgeError",
     "DotsBridge",
     "ReplyTimeoutError",
+    "RequestCancelledError",
     "ReceivedMessage",
     "Settings",
     "create_app",

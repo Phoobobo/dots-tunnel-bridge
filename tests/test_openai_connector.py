@@ -565,7 +565,7 @@ def test_websocket_failed_response_does_not_stop_subsequent_turn():
     assert len(bridge.sent) == 2
 
 
-def test_websocket_disconnect_cancels_reply_wait_and_drops_unsent_queue():
+def test_websocket_disconnect_stops_waiting_for_already_enqueued_requests():
     bridge = FakeBridge(blocked={"pending"})
     with TestClient(create_openai_connector(api_key=KEY, client=bridge)) as http:
         with http.websocket_connect("/v1/responses", headers=AUTH) as socket:
@@ -575,7 +575,7 @@ def test_websocket_disconnect_cancels_reply_wait_and_drops_unsent_queue():
             assert bridge.started.wait(1)
             socket.send_json({"type": "response.create", "input": "queued"})
         assert bridge.cancelled.wait(1)
-        assert [text for text, _ in bridge.sent] == ["pending"]
+        assert [text for text, _ in bridge.sent] == ["pending", "queued"]
 
 
 @pytest.mark.parametrize(
@@ -610,4 +610,7 @@ def test_websocket_queue_is_bounded_without_enqueuing_rejected_messages_upstream
             assert all(event["type"] == "error" for event in errors)
             assert all(event["error"]["code"] == "rate_limit_exceeded" for event in errors)
         assert bridge.cancelled.wait(1)
-    assert [text for text, _ in bridge.sent] == ["pending"]
+    assert [text for text, _ in bridge.sent] == [
+        "pending",
+        *(f"queued-{index}" for index in range(16)),
+    ]
