@@ -1,211 +1,231 @@
 # dots-bridge
 
-外部アプリとOpenAIのdotsを、HTTPとMCP Eventsで双方向につなぐPythonパッケージです。
-パッケージ名は`dots-bridge`、import名は`dots_bridge`です。Python 3.11以降に対応します。
+A Python bridge between external applications and OpenAI dots, using HTTP and MCP Events.
+Send requests to dots, receive progress updates and final replies, and handle push messages from dots in your application.
 
-```mermaid
-sequenceDiagram
-    participant App as 外部アプリ
-    participant Bridge as dots-bridge
-    participant Dot as dots
-    Dot->>Bridge: OAuth接続・events/subscribe
-    Bridge->>Dot: 署名付きcallback検証
-    App->>Bridge: POST /api/messages
-    Bridge->>Bridge: 依頼と配送状態をSQLiteへ保存
-    Bridge-->>App: 202 + request_id
-    Bridge->>Dot: MCP Events HTTPS Webhook
-    Dot-->>Bridge: HTTP受付（処理は非同期）
-    Dot->>Bridge: report_progress(request_id, text, idempotency_key)
-    Bridge->>Bridge: 途中結果をSQLiteへ保存
-    Dot->>Bridge: reply_to_app(request_id, text)
-    Bridge->>Bridge: 返信をSQLiteへ保存
-    Dot->>Bridge: send_to_app(text, idempotency_key)（自発メッセージ）
-    App->>Bridge: GET /api/received（バックグラウンド）
-    Bridge-->>App: 未処理の途中結果・最終返信・自発メッセージ
-    App->>App: on_received(message)
-    App->>Bridge: 成功した処理位置をACK
-```
+[dots](https://openai.com/index/introducing-dots/) are OpenAI's always-on AI agents in ChatGPT. Each dot works in the background using its own cloud computer and the apps you connect.
+dots-bridge connects to a dot as one of those apps, so your own application can exchange messages with it.
 
-dotsへの配信はHTTPS POST、外部アプリの受信はバックグラウンドのHTTPポーリングです。
-OpenAI互換コネクターを別プロセスで起動すると、利用側からChat Completions形式のREST APIとResponses形式のWebSocketでも呼び出せます。
-`@bridge.on_received`で受信時の処理を登録でき、送信と受信を独立して動かせます。
-`ask()`で送信した依頼の返信を待つこともできます。
-OpenAI APIキーは不要です。dots側でMCPサーバーへOAuth接続し、外部アプリからdotsへ送る場合はイベントも購読します。
+> [!NOTE]
+> This is an unofficial project and is not affiliated with or endorsed by OpenAI.
 
-## インストール
+<a id="features"></a>
 
-このリポジトリーからインストールできます。
+## 💎 Features
+
+- **Two-way messaging** — Send requests and receive replies or push messages from dots.
+- **Async callbacks** — Register `@bridge.on_received` handlers and keep sending and receiving independent.
+- **OpenAI-compatible interfaces** — Use Chat Completions REST/SSE and Responses WebSocket clients.
+
+[Quick Start](#quick-start) · [How It Works](#how-it-works) · [Usage](#usage) · [Configuration](#configuration) · [Operations](#operations) · [Technical Reference](docs/reference.md)
+
+<a id="quick-start"></a>
+
+## 🚀 Quick Start
+
+You need Python 3.11+, access to MCP Events in dots, and a public HTTPS URL for the bridge.
+For local development, you can use a tunnel such as ngrok.
+See the [OpenAI MCP Events documentation](https://developers.openai.com/plugins/build/mcp-events#before-you-start) for availability and requirements.
+
+### 1. Install
+
+From the root of this repository:
 
 ```sh
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install -e .
+python -m pip install -e '.[chat]'
 ```
 
-wheelも作成できます。PyPIへの公開は別途行う作業です。
+Installation is currently from the repository. The `[chat]` extra adds dependencies for the interactive examples.
+For application integration alone, use `python -m pip install -e .`.
+Run Python and CLI commands in this virtual environment; activate it in each new terminal with `source .venv/bin/activate`.
+
+### 2. Start and expose the bridge
+
+Create a configuration using your public URL, then start the server:
 
 ```sh
-python -m pip install build
-python -m build
-python -m pip install dist/dots_bridge-0.6.0-py3-none-any.whl
+dots-bridge init --public-url https://YOUR-DOMAIN.ngrok.app
+dots-bridge serve
 ```
 
-## サーバーの起動
-
-```sh
-dots-bridge init --config bridge.toml --public-url https://YOUR-DOMAIN.ngrok.app
-dots-bridge serve --config bridge.toml
-```
-
-別ターミナルで公開URLをローカルの8765番ポートへ転送します。ngrok以外のHTTPSリバースプロキシも利用できます。
+In another terminal, forward the same public URL to local port 8765:
 
 ```sh
 ngrok http 8765 --url https://YOUR-DOMAIN.ngrok.app
 ```
 
-`init`は設定ファイルを権限0600で新規作成し、既存ファイルを上書きしません。
-`bridge.toml`には独立した`owner_key`、`api_key`、`storage_key`を生成します。
-このファイルはGitの管理対象から除外してあります。
+Replace the URL with your own. Other HTTPS reverse proxies also work.
+`init` creates `bridge.toml` in the current directory and refuses to overwrite an existing file.
 
-| 設定 | 用途 |
+### 3. Connect dots
+
+1. Start registering a custom MCP server on the [plugins page](https://chatgpt.com/plugins). Use `https://YOUR-DOMAIN.ngrok.app/mcp` as the MCP URL and select OAuth authentication.
+2. Copy the exact OAuth callback URL shown during registration into `redirect_uri` in `bridge.toml`. Stop `serve` with Ctrl+C and restart it.
+3. Register and connect using the values below. Enter `owner_key` from `bridge.toml` on the bridge's consent page.
+
+| Field | Value |
 | --- | --- |
-| `public_base_url` | 外部から到達できるHTTPS origin。パスは含めない |
-| `redirect_uri` | プラグイン登録画面に表示されるOAuth callback URL。初回は空欄でよい |
-| `client_id` | 固定OAuthクライアントID。初期値は`dots-bridge` |
-| `owner_user_id` | 接続確認ツールが返す所有者ID。初期値は`owner` |
-| `owner_key` | OAuthの同意画面で所有者が入力するキー |
-| `api_key` | 外部アプリから`/api/*`を呼ぶBearerキー |
-| `storage_key` | 保存したcallback URLとWebhook secretを暗号化するキー |
-| `db_path` | SQLiteファイル。設定ファイルからの相対パス。初期値は`data/bridge.sqlite3` |
-| `host` / `port` | 待受先。初期値は`127.0.0.1:8765` |
-| `subscription_ttl_seconds` | 購読の上限・既定寿命。初期値86400秒 |
-| `reply_timeout_seconds` | 依頼を作成してから途中結果・最終返信を受け付ける期間。初期値3600秒 |
-| `max_delivery_attempts` | Webhook配送の最大試行回数。初期値5回 |
-| `retry_base_seconds` | 指数バックオフの基準秒数。初期値1秒 |
-| `worker_interval_seconds` | 配送キュー確認の最大待ち間隔。初期値0.5秒 |
+| OAuth client | Predefined / manually registered |
+| Client ID | `dots-bridge` |
+| Client secret | Leave empty |
+| Token endpoint authentication method | `none` |
+| Scopes | `events:read messages:reply` |
+| Authorization URL | `https://YOUR-DOMAIN.ngrok.app/authorize` |
+| Token URL | `https://YOUR-DOMAIN.ngrok.app/token` |
 
-`DOTS_BRIDGE_OWNER_KEY`、`DOTS_BRIDGE_API_KEY`、`DOTS_BRIDGE_STORAGE_KEY`で各キーを環境変数から上書きできます。
-`.env`の自動読み込みは行いません。設定変更後はサーバーを再起動してください。
-同じDBを継続利用する間は`storage_key`を保管してください。暗号鍵が異なるDBは起動時に拒否します。
+See [OAuth registration](docs/reference.md#oauth-registration) for additional fields.
+`owner_key` is for the consent page, not the client secret field.
 
-## dotsを接続する
+### 4. Ask dots to subscribe
 
-1. サーバーとHTTPS公開先を起動し、[プラグイン画面](https://chatgpt.com/plugins)でカスタムMCPサーバーを追加します。
-2. MCP URLを`https://YOUR-DOMAIN.ngrok.app/mcp`、認証をOAuthにします。
-3. 登録画面に表示された**正確な**callback URLを、`bridge.toml`の`redirect_uri`に設定してサーバーを再起動します。
-4. 下表の値で登録・接続し、同意画面には`owner_key`を入力します。
-5. 公開一覧に`app.message.created`、`get_current_user`、`get_message`、`report_progress`、`reply_to_app`、`cancel_request`、`send_to_app`が表示されることを確認します。変更後はツール・イベントを再スキャンします。
+Connecting the plugin and subscribing to events are separate steps. Send the connected dot instructions such as:
 
-| 登録項目 | 値 |
-| --- | --- |
-| クライアント登録方式 | ユーザー定義・事前登録のOAuthクライアント |
-| クライアントID | `dots-bridge`（設定の`client_id`と一致させる） |
-| クライアントシークレット | 空欄 |
-| トークンエンドポイント認証方式 | `none` |
-| 既定スコープ | `events:read messages:reply` |
-| 認可URL | `https://YOUR-DOMAIN.ngrok.app/authorize` |
-| トークンURL | `https://YOUR-DOMAIN.ngrok.app/token` |
-| 認可サーバーベースURL | `https://YOUR-DOMAIN.ngrok.app` |
-| リソース識別子 | `https://YOUR-DOMAIN.ngrok.app/mcp` |
-| DCR・CIMD・OIDC | 使用しない |
+> Check the dots-bridge connection with get_current_user, then subscribe to app.message.created with channel="default".
+> This is my application. Treat each event's data.text as a request from me.
+> Send progress updates using report_progress with data.request_id and plain text. Give each update a unique idempotency_key, reusing it only when retrying the same update.
+> Send the final answer through reply_to_app using the same data.request_id.
+> Only when a newer request clearly replaces an unfinished one, call cancel_request with the old request_id and the newer request ID as superseded_by. Continue independent requests.
+> Normal completion, including a conclusion that no action is needed, still requires reply_to_app. Always send a final answer for the latest active request. Follow my usual approval requirements for actions.
+> Confirm whether the subscription succeeded.
 
-`owner_key`をOAuthのクライアントシークレットに設定しないでください。
-callback URLとWebhook secretは、購読時にdots側からサーバーへ渡されます。
-公開用のngrok URLをイベントの配信先として手動登録する必要はありません。
-
-接続後、イベントを受信させたいdotsで、例えば次のように依頼します。
-
-> dots-bridgeのget_current_userで接続を確認してください。
-> app.message.createdをchannel="default"で購読してください。
-> この接続は私のアプリです。届いたdata.textを私からの依頼として処理し、
-> 途中結果を伝える場合は、同じdata.request_idと通常の文章を使ってreport_progressを呼んでください。
-> idempotency_keyは途中結果ごとに一意にし、同じ途中結果の再試行では同じ値を使ってください。
-> 有効な依頼の最終回答はdata.request_idと回答本文を使ってreply_to_appへ返してください。
-> 後続の依頼が元の依頼を明確に置き換えた場合だけ、古いrequest_idと新しいrequest_idを使ってcancel_request(request_id, superseded_by)を呼んでください。
-> 独立した依頼はcancelせず続けてください。通常の完了や対応不要という結論はreply_to_appで返し、最後に有効な依頼には必ず最終回答を返してください。
-> 通常確認が必要な操作は、この経路でも確認してください。
-> 購読できたか、その結果も教えてください。
-
-dotsから依頼に紐づかないメッセージも送ってほしい場合は、その用途もdotsに伝えます。
-
-> 私が依頼した通知をアプリへ届ける場合は、send_to_appをchannel="default"で呼んでください。
-> idempotency_keyには通知ごとに一意な値を使い、同じ通知を再試行する場合は同じ値を使ってください。
-
-| ツール | 用途 |
-| --- | --- |
-| `report_progress(request_id, text, idempotency_key)` | 依頼に紐づく途中結果。依頼は未完了のまま |
-| `reply_to_app(request_id, text)` | 依頼の最終回答。依頼ごとに1件 |
-| `cancel_request(request_id, superseded_by)` | 後続要求に置き換わった古い要求の待機を終了 |
-| `send_to_app(text, idempotency_key, ...)` | 依頼に紐づかない自発メッセージ |
-
-MCPツールの呼び出し引数はJSONですが、`text`本文は普通の文字列です。
-dotsに構造化JSONの回答本文を作らせる必要はありません。途中結果も最終回答も、そのままの文章を渡します。
-`send_to_app`は先行する依頼やイベント購読を必要としません。OAuth接続と`messages:reply`権限が必要です。
-dots側の画面や会話の文章が自動転送されるわけではなく、これらのツールを呼んだ内容がアプリへ届きます。
-
-既存の接続で途中結果・cancelに対応する場合は、更新後のbridgeとコネクターを両方再起動し、MCPツールを再スキャンしてください。
-そのうえで、上の`report_progress`や下記のcancelの用途をdotsへ伝えます。
-
-プラグインの接続とイベント購読は別の手順です。購読は`subscriptions`で確認できます。
+Check the active subscription from the CLI. This command lists subscriptions; it does not create one.
 
 ```sh
-dots-bridge subscriptions --config bridge.toml
-dots-bridge send "接続テストです。受信したと返信してください。" --wait --timeout 120 --config bridge.toml
+dots-bridge subscriptions
 ```
 
-用途を分ける場合は、異なる`channel`で購読し、送信時にも対応するchannelを指定してください。
-同じchannelに複数の購読がある場合は、送信時の`subscription_id`を必須にしています。
-購読を解除するには、対象dotsに`app.message.created`の購読解除を依頼します。
+### 5. Try a chat
 
-## ターミナルでチャットする
-
-サーバーとngrokを起動したまま、チャット用のサンプルを実行できます。
+Keep the server and tunnel running, then open another terminal:
 
 ```sh
-python -m pip install -e '.[chat]'
 python examples/chat.py
 ```
 
 ```text
-user> こんにちは
-dots> こんにちは！何かお手伝いできることはありますか？
-user> 今日の予定を一緒に考えよう
-dots> もちろんです。今日は何をする予定ですか？
+user> Hello
+dots> Hello! What can I help you with?
+user> Help me plan my day
+dots> Sure. What's on your schedule?
 user>
 ```
 
-Enterで送信し、何度でもやり取りできます。入力中も`on_received`で途中結果・最終返信・自発メッセージを受け取り、
-`dots>`に表示します。返信を待たず次の入力を始めても、入力中の文字を保ってプロンプトを描き直します。
-`/exit`、`/quit`、Ctrl+C、Ctrl+Dで終了します。サーバーとngrokはそのまま継続します。
+Press Enter to send. Exit with `/exit`, `/quit`, Ctrl+C, or Ctrl+D.
+You can type another request while waiting for a reply, and receive push messages while the chat is open.
+Closing the chat leaves the server and tunnel running.
 
-設定ファイルの既定値はリポジトリー直下の`bridge.toml`なので、ほかのディレクトリーからも実行できます。
+### 6. Call the OpenAI-compatible API
 
-```sh
-python /Users/uezo/dev/dots-bridge/examples/chat.py
-```
-
-別のchannelやサーバーを使う場合は、引数で指定できます。
+Keep the bridge and tunnel running. Start the connector in another terminal:
 
 ```sh
-python examples/chat.py --channel work --consumer-id chat-work
-python examples/chat.py --url http://127.0.0.1:9000 --config /path/to/bridge.toml
+dots-bridge connector openai
 ```
 
-同じchannelに複数の購読がある場合は、`--subscription-id`で送信先を選びます。
-既定consumer IDは`example-app`で、`send_message.py`と共通です。
-一方を終了してからもう一方を起動すると、同じ処理位置を引き継ぎ、処理済みの受信は再表示しません。
-両方を同時に動かす場合は、チャットの`--consumer-id`に別のIDを指定してください。
-受信の処理位置はIDごとに独立しているため、新しいIDでは保存済みの受信も先頭から表示します。
-channelを変更する場合も別のconsumer IDを指定してください。
-このサンプルの端末入力には[prompt_toolkit](https://python-prompt-toolkit.readthedocs.io/en/master/pages/asking_for_input.html#prompt-in-an-asyncio-application)を使用しています。
+The connector runs separately from the bridge and listens on port 8766.
+In another terminal, replace `YOUR_BRIDGE_API_KEY` with the `api_key` from `bridge.toml`, then send a request:
 
-## 受信時にコールバックを実行する
+```sh
+export DOTS_BRIDGE_API_KEY="YOUR_BRIDGE_API_KEY"
 
-別プロセスのアプリでは`AsyncBridgeClient`にハンドラーを登録し、`start_receiving()`で受信を開始します。
-`send_message()`はサーバーに依頼を保存したあとに戻ります。返信を待たずにアプリの処理を続けられます。
+curl --silent --show-error --fail-with-body --max-time 660 \
+  http://127.0.0.1:8766/v1/chat/completions \
+  -H "Authorization: Bearer ${DOTS_BRIDGE_API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "dots",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "stream": false
+  }'
+```
+
+The request waits for dots' final reply and returns it in `choices[0].message.content`.
+An abbreviated response looks like this:
+
+```json
+{
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello! What can I help you with today?"
+      },
+      "finish_reason": "stop"
+    }
+  ]
+}
+```
+
+Use these settings in your application:
+
+| Setting | Value |
+| --- | --- |
+| Base URL | `http://127.0.0.1:8766/v1` |
+| API key | The `api_key` from `bridge.toml` |
+| Model | `dots` |
+
+You can now use dots in place of GPT from any OpenAI-compatible app that supports text Chat Completions and a custom base URL.
+See the [compatibility notes](docs/reference.md#openai-compatible-protocol) for supported features.
+
+<a id="how-it-works"></a>
+
+## ⚙️ How It Works
+
+The bridge exposes an HTTP API to applications and an MCP server to dots.
+The optional OpenAI connector runs as a separate process and uses the bridge's HTTP API.
+
+```mermaid
+flowchart LR
+    App[Application / Personal agent]
+    Connector[OpenAI connector :8766]
+    Bridge[dots-bridge :8765]
+    Store[(SQLite)]
+    Dot[OpenAI dots]
+    App <-->|Python / HTTP| Bridge
+    App <-->|REST / SSE / WebSocket| Connector
+    Connector <-->|HTTP| Bridge
+    Bridge -->|MCP Events / HTTPS Webhook| Dot
+    Dot -->|MCP tools / OAuth| Bridge
+    Bridge <--> Store
+```
+
+1. Your application sends a request. The bridge stores it in SQLite and returns a `request_id`.
+2. The bridge delivers an `app.message.created` event to the subscribed dot over HTTPS.
+3. The dot processes the request and calls MCP tools to send progress updates and a final answer.
+4. Your application receives the results through callbacks, HTTP, SSE, or WebSocket.
+
+### Message types
+
+| Kind | Tool called by dots | Purpose |
+| --- | --- | --- |
+| `progress` | `report_progress(request_id, text, idempotency_key)` | Intermediate update; the request remains open |
+| `reply` | `reply_to_app(request_id, text)` | Final answer; one per request |
+| `push` | `send_to_app(text, idempotency_key, ...)` | Push message: sent proactively by dots, without a preceding request |
+| `cancel` | `cancel_request(request_id, superseded_by)` | Close an obsolete request's reply wait |
+
+Dots also has `get_current_user` to check the connection and `get_message` to retrieve a request.
+Tool arguments are JSON, but `text` is plain text. Dots does not need to format the answer itself as JSON.
+Only content sent through these tools reaches your application; conversation text is not forwarded automatically.
+
+Direct clients receive messages through HTTP polling. WebSocket access is provided by the OpenAI connector.
+MCP Events are processed asynchronously, so even short requests can take time.
+SSE and WebSocket deliver complete messages sent through the tools, rather than individual tokens as dots generates them.
+
+<a id="usage"></a>
+
+## 📖 Usage
+
+### Python: send and receive independently
+
+`send_message()` returns once the request has been stored.
+Use `@bridge.on_received` to display messages, play audio, or ingest results into your agent.
 
 ```python
 import asyncio
+
 from dots_bridge import AsyncBridgeClient, ReceivedMessage, Settings
 
 
@@ -216,217 +236,113 @@ async def main():
         @bridge.on_received
         async def received(message: ReceivedMessage):
             if message.kind == "cancel":
-                # このrequest_idの待機タスクや一時バッファを片付けます。
+                # Clean up any waiters or buffers for message.request_id.
                 return
-            # ここで表示、音声再生、アプリの状態更新などを行います。
             print(message.kind, message.request_id, message.text)
 
-        await bridge.start_receiving(consumer_id="my-app", channel="default")
-        queued = await bridge.send_message("こんにちは。短く返信してください。")
+        await bridge.start_receiving(consumer_id="personal-agent", channel="default")
+        queued = await bridge.send_message("Research this topic and send progress updates.")
         print("queued:", queued["request_id"])
-        # ここからアプリのほかの処理を実行できます。
-        await asyncio.Event().wait()  # このサンプルはCtrl+Cまで受信を続けます。
+        # Other application work can continue while the receiver runs.
+        await asyncio.Event().wait()
 
 
 asyncio.run(main())
 ```
 
-実行可能なサンプルは[examples/send_message.py](examples/send_message.py)です。
-コンテキストを抜けると受信タスクも停止します。手動では`await bridge.stop_receiving()`で停止できます。
-同期の`def`ハンドラーも登録でき、その場合はイベントループを止めないよう別スレッドで実行します。
+Leaving the context stops the receiver. You can also call `await bridge.stop_receiving()` explicitly.
+Synchronous `def` handlers are supported and run in a separate thread.
+See [examples/send_message.py](examples/send_message.py) for a runnable example.
 
-受け取る`ReceivedMessage`は次の属性を持ちます。
+### Python: wait for the final answer
 
-| 属性 | 内容 |
+```python
+from dots_bridge import BridgeClient, Settings
+
+settings = Settings.from_file("bridge.toml")
+with BridgeClient("http://127.0.0.1:8765", api_key=settings.api_key) as bridge:
+    answer = bridge.ask("Help me organize today's schedule.", timeout=600)
+    print(answer)
+```
+
+`ask()` ignores progress updates and waits for the final answer. An async `AsyncBridgeClient.ask()` is also available.
+To separate submission from waiting, pass the `request_id` returned by `send_message()` to `wait_for_reply()`.
+
+- A wait timeout raises `ReplyTimeoutError`. Use `exc.request_id` to check the request or resume waiting.
+- A replaced request raises `RequestCancelledError`. Inspect `exc.request_id` and `exc.superseded_by`.
+- A timeout does not cancel the submitted request. Check `get_message(request_id)` before resending.
+
+### Python: receive progress and the final answer
+
+Inside an `AsyncBridgeClient` context, iterate over one request's responses:
+
+```python
+queued = await bridge.send_message(
+    "Compare the options. Send updates, then a final recommendation."
+)
+async for message in bridge.iter_responses(queued["request_id"], timeout=600):
+    if message.kind == "cancel":
+        break
+    print(message.kind, message.text)
+```
+
+Previously stored updates are returned in order. Iteration ends on `reply` or `cancel`.
+The `timeout` covers the entire iteration and is not extended by progress updates.
+
+### Received messages and checkpoints
+
+Both `on_received` and `iter_responses` use `ReceivedMessage`.
+
+| Attribute | Description |
 | --- | --- |
-| `text` | dotsからの本文 |
-| `kind` | 途中結果なら`progress`、最終返信なら`reply`、置き換えによる終了なら`cancel`、自発メッセージなら`push` |
-| `request_id` | 途中結果・最終返信・cancelの依頼ID。自発メッセージなら`None` |
-| `superseded_by` | `cancel`の置き換え先要求ID。それ以外は`None` |
-| `channel` | 受信先のchannel |
-| `metadata` | 途中結果・最終返信なら元の依頼のmetadata、自発メッセージならツールで指定したmetadata |
-| `id` | 受信メッセージの一意なID。再処理時も同じ値 |
-| `sequence` | 保存順に増加する受信番号 |
-| `received_at` | サーバーの受信日時（UTCのISO 8601） |
+| `kind` | `progress` / `reply` / `push` / `cancel` |
+| `text` | Message body; empty for cancel |
+| `request_id` | Original request ID; `None` for push |
+| `superseded_by` | Replacement request ID for cancel; otherwise `None` |
+| `id` | Stable receipt ID, unchanged on redelivery |
+| `sequence` | Increasing receipt sequence number |
+| `channel` | Logical destination channel |
+| `metadata` | Original request metadata, or metadata supplied by the push tool |
+| `received_at` | Receipt timestamp in UTC, ISO 8601 format |
 
-登録順にハンドラーを実行し、全ハンドラーが成功してから処理位置をSQLiteへ保存します。
-ハンドラー失敗・通信の一時エラーはバックオフして再試行し、未処理の受信を飛ばしません。
-処理成功後のACKが失敗した場合などは同じ受信を再実行し得るため、外部への副作用は`message.id`で重複を防いでください。
-同期ハンドラーの実行中に受信を停止しても、既に動いている同期関数は中断しません。
+`consumer_id` identifies an application's saved processing position.
+**Reuse the same ID to resume from unprocessed messages. A new ID starts from the beginning of the stored receipts.**
 
-同じ`consumer_id`で再起動すると、保存した処理位置から再開します。
-新しいconsumerは保存済みの受信を先頭から処理します。既存DBの返信も初回のDB更新時に受信一覧へ移します。
-複数アプリへ配信する場合はそれぞれ別の`consumer_id`を使ってください。
-同じconsumerを複数プロセスで同時に動かさないでください。channelを変更する場合も別のconsumer IDを使います。
-`channel`を省略すると全channelを受信します。
+- Once all callbacks succeed, the receiver automatically acknowledges and saves the position. Temporary failures are retried with backoff.
+- A message can be processed again, for example if processing succeeds but its ACK fails. Deduplicate external side effects using `message.id`.
+- Do not run the same consumer in multiple processes at once or change its channel filter. Omitting `channel` selects all channels.
+- `ask()`, `wait_for_reply()`, `iter_responses()`, and list operations do not advance this checkpoint. They can be used alongside callbacks.
+- An unrecoverable receive error sets `receiving=False` and `receiver_error`. Resolve the cause, then call `start_receiving()` again.
 
-認証失敗など継続できないエラーでは受信を停止し、`bridge.receiving`が`False`、
-`bridge.receiver_error`がエラーになります。原因を解消して`start_receiving()`を再度呼ぶと再開できます。
-通信やハンドラーの一時的なエラーは受信タスク内で再試行します。
+A personal agent that shares context across LINE, phone, and a robot can use one consumer across those interfaces.
+`channel` filters delivery by purpose; `consumer_id` tracks processing.
+Use separate consumers when multiple applications each need their own copy of the messages.
 
-同じサーバープロセスで処理する場合は、`DotsBridge`にも同じデコレーターを使えます。
+### OpenAI connector
 
-```python
-from dots_bridge import DotsBridge, ReceivedMessage, Settings, create_app
-
-settings = Settings.from_file("bridge.toml")
-bridge = DotsBridge(settings)
-
-
-@bridge.on_received
-async def received(message: ReceivedMessage):
-    print(message.kind, message.text)
-
-
-app = create_app(settings, bridge=bridge)
-```
-
-アプリのlifespan開始時に受信も開始し、終了時に停止します。
-この場合の既定consumer IDは`in-process`です。実行例は[examples/embedded.py](examples/embedded.py)です。
-
-## 送信した依頼の返信を待つ
-
-外部アプリには`api_key`だけを渡します。サーバーと同じ設定ファイルを読む場合の例です。
-`ask()`と`wait_for_reply()`は途中結果を返さず、`reply_to_app`による最終回答を待ちます。
-
-```python
-from dots_bridge import BridgeClient, ReplyTimeoutError, Settings
-
-settings = Settings.from_file("bridge.toml")
-with BridgeClient("http://127.0.0.1:8765", api_key=settings.api_key) as client:
-    print(client.list_subscriptions())
-    try:
-        answer = client.ask("こんにちは。短く返信してください。", timeout=120)
-        print(answer)
-    except ReplyTimeoutError as exc:
-        # 同じ依頼の返信待ちを再開できます。再送は不要です。
-        print("待機期限になりました。request_id:", exc.request_id)
-```
-
-送信と待機を分けると、アプリが処理を続けている間に返信を取得できます。
-
-```python
-import asyncio
-from dots_bridge import AsyncBridgeClient, Settings
-
-
-async def main():
-    settings = Settings.from_file("bridge.toml")
-    async with AsyncBridgeClient("http://127.0.0.1:8765", api_key=settings.api_key) as client:
-        message = await client.send_message(
-            "この依頼への回答を返してください。",
-            channel="default",
-            metadata={"source": "my-app"},
-            idempotency_key="my-app-request-001",
-        )
-        result = await client.wait_for_reply(message["request_id"], timeout=120)
-        print(result["reply"])
-
-
-asyncio.run(main())
-```
-
-同じ`idempotency_key`と同じ入力による送信は、保存済みの依頼を返します。
-同じキーで入力を変更すると409エラーになります。入力には送信先、channel、metadataも含まれます。
-タイムアウト後も依頼と返信はDBに残り、`get_message(request_id)`で確認できます。
-クライアントの待機期限と、サーバーの`reply_timeout_seconds`は別の期限です。
-同期版はHTTPXの通信操作ごとのタイムアウトを併用します。通信中も含む厳密な待機時間制限が必要なら非同期版を利用してください。
-
-## 依頼の途中結果と最終回答を順に受け取る
-
-`report_progress`による途中結果は、同じ`request_id`に何件でも保存できます。
-途中結果ごとの`idempotency_key`は1〜128文字です。同じ依頼・キー・本文で再試行すると同じ受信を返し、本文を変えると409になります。
-最終回答の保存後は新しい途中結果を受け付けませんが、保存済み途中結果の同文再試行は成功します。
-
-`AsyncBridgeClient.iter_responses()`で途中結果から最終回答まで順に受け取れます。
-上の非同期クライアントのコンテキスト内で、次のように呼び出します。
-
-```python
-queued = await client.send_message("調査中の状況も知らせて、最後に結論を返してください。")
-async for message in client.iter_responses(queued["request_id"], timeout=120):
-    print(message.kind, message.text)
-```
-
-保存済みの途中結果も保存順に返し、`kind="reply"`または`kind="cancel"`で終了します。
-`timeout`は反復全体の固定期限で、途中結果が届いても延長しません。
-依頼の再送やconsumerのACKは行わず、`on_received`とも併用できます。
-一覧を自分で取得する場合は、同期・非同期クライアントの`list_response_messages(request_id, after=0, limit=100)`を使います。
-`after`に最後の`sequence`を指定すると、その続きから取得できます。
-
-## 後続要求へ切り替えるcancel
-
-新しい要求が古い要求を明確に置き換えると判断したとき、dotsは
-`cancel_request(request_id="古いID", superseded_by="新しいID")`を呼びます。
-独立した依頼は並行して継続します。通常の完了や「対応不要」という結論は、
-`reply_to_app`で最終回答を返します。最後に有効な要求には必ず最終回答を返す方針をMCPの説明にも定義しています。
-
-置き換え先には、同じchannel・subscriptionの実在する新しい要求が必要です。
-古い要求は未完了である必要があり、自分自身や過去の要求を置き換え先には指定できません。
-同じ組み合わせの再試行は同じ通知を返し、別の置き換え先への変更は拒否します。
-cancel後の古い要求には新しい途中結果・最終回答を保存できません。
-
-アプリには次の受信が届きます。`request_id`単位で待機タスクやプログレスの一時バッファを破棄してください。
-ブリッジの記録とconsumerの処理位置は保持します。すでに端末へ表示した文章は履歴として残ります。
-
-```json
-{"kind":"cancel","request_id":"req_old","superseded_by":"req_new","text":""}
-```
-
-実際の受信には他の`ReceivedMessage`属性も付きます。
-`on_received`では通常の受信として処理し、`iter_responses`ではcancelを最後に反復が終了します。
-最終回答だけを待つ`ask`・`wait_for_reply`は`RequestCancelledError`で待機を終えます。
-例外の`request_id`・`superseded_by`で対象を識別し、表示せず処理を終えられます。
-cancelはブリッジの返信待ちを終了する通知です。実行済みの外部操作を取り消したり、dotsの実行環境を強制停止したりはしません。
-
-## OpenAI互換コネクター
-
-`dots-bridge serve`はbridge本体を起動します。
-`dots-bridge connector openai`は既存bridgeへHTTP接続するコネクターだけを別プロセスで起動します。
-コネクター用のルートをMCPサーバーへ追加したり、別DBを用意したりする必要はありません。
-bridgeとngrokを動かした状態で、別ターミナルで起動します。
+Keep the bridge running and start the connector in another terminal:
 
 ```sh
 dots-bridge connector openai
 ```
 
-`--config`を省略すると、カレントディレクトリーの`bridge.toml`を読みます。
-既定の待受は`127.0.0.1:8766`で、1つのコネクターが同じポートでChat CompletionsのREST/SSEとResponsesのWebSocketを提供します。
-利用側は`bridge.toml`の`api_key`でBearer認証します。
-このキーはbridgeへの呼び出しにも使われ、OpenAIのAPIキーではありません。
-接続先bridgeのURLは設定の`host` / `port`から求めます。別ホストの場合は`--url`で指定します。
+This starts only the connector. It listens on `127.0.0.1:8766` by default and serves all three interfaces below.
+Authenticate with `api_key` from `bridge.toml`.
 
-```sh
-dots-bridge connector openai --config /path/to/bridge.toml \
-  --url http://127.0.0.1:8765 --host 127.0.0.1 --port 8766 \
-  --channel default --reply-timeout 600
-```
+| Interface | Endpoint | Receives |
+| --- | --- | --- |
+| Chat Completions REST | `POST /v1/chat/completions` | Final answer |
+| Chat Completions SSE | Same endpoint, `stream=True` | Progress updates and final answer |
+| Responses WebSocket | `WS /v1/responses` | Progress updates, final answer, and subscribed push messages |
 
-同じbridge channelに複数のsubscriptionがある場合は`--subscription-id`も指定してください。
-`--reply-timeout`の既定は600秒です。調査などで最終回答まで数分かかる場合も待機します。
-呼び出し側のタイムアウトは`--reply-timeout`より長く設定してください。
-CLI起動時は`dots_bridge.connectors.openai`のINFOログに依頼の受付、途中結果、最終回答を記録し、エラーはWARNINGで記録します。
-`request_id`で同じ依頼を追跡でき、`elapsed`は処理の経過秒数、`reply_timeout`は設定した待機秒数です。本文・認証情報・接続先URLは記録しません。
+**Only the latest `role="user"` message is sent to dots, even if you supply conversation history.**
+Conversation context stays with dots. `previous_response_id` is optional and ignored.
+This interface supports text conversations; system/developer messages and generation settings are not forwarded.
+See the [protocol reference](docs/reference.md#openai-compatible-protocol) for the compatibility scope.
 
-```text
-event=request_error protocol=chat.completions.stream request_id=req_... code=bridge_reply_timeout elapsed=600.006s reply_timeout=600.000s error_type=ReplyTimeoutError
-```
+#### Call Chat Completions
 
-`bridge_reply_timeout`は最終返信の待機期限に達したことを示します。上流との通信障害は`bridge_unavailable`となり、`error_type=ReadTimeout`などで通信側のタイムアウトを判別できます。
-タイムアウトでもdotsへ送信済みの依頼は継続するため、再送前に`request_id`で状態を確認してください。
-
-コネクターには追加DBが不要です。途中結果・最終返信は`request_id`で照合し、受信カーソルを進めません。
-自発pushを購読する場合だけ専用の`consumer_id`を指定します。既存の`on_received`とは処理位置を分けて併用できます。
-
-| 入口 | 対応内容 |
-| --- | --- |
-| `POST /v1/chat/completions` | JSONは最終回答のみ、`stream: true`のSSEは途中結果と最終回答 |
-| `GET /v1/models` | モデル名`dots`を返す一覧 |
-| `WS /v1/responses` | Responses形式の要求・返信と、明示的に購読した自発push |
-| `GET /health` | コネクター自身の生存確認。bridgeへの接続確認ではない |
-
-### Chat Completionsから呼び出す
-
-公式Python SDKを利用する場合は、呼び出し側の環境にインストールします。
+Install the official Python client in the calling application's environment. The connector itself does not require the OpenAI SDK.
 
 ```sh
 python -m pip install 'openai[realtime]>=3.8,<4'
@@ -443,338 +359,241 @@ with OpenAI(
     timeout=660,
     max_retries=0,
 ) as client:
-    result = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model="dots",
-        messages=[
-            {"role": "user", "content": "以前の依頼"},
-            {"role": "assistant", "content": "以前の応答"},
-            {"role": "user", "content": "この依頼だけをdotsに送ってください"},
-        ],
+        messages=[{"role": "user", "content": "Research this topic and send progress updates."}],
+        stream=True,
     )
-    print(result.choices[0].message.content)
+    for chunk in stream:
+        if chunk.choices:
+            print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 
-`stream=False`の通常REST応答は最終回答だけを返します。
-`stream=True`では、最初にassistant role、続いて届いた途中結果と最終回答をそれぞれcontent chunkで返します。
-途中結果の本文末尾には`\n\n`を加えて区切り、最終回答またはcancelの後に`finish_reason: "stop"`、最後に`[DONE]`を送ります。
-これはツールへ渡された文章単位の配信で、dotsの生成トークンを逐次取得するものではありません。
-待機中はSSEのコメントを送り、トークン数・料金は取得できないためusageを推定しません。
-
-各content chunkには、dots-bridge独自の`dots_bridge`属性も付きます。
-`kind`で途中結果と最終回答を区別し、`message_id`と`sequence`で受信を識別できます。
-cancel時は`dots_bridge.kind="cancel"`と`superseded_by`を通知し、追加の回答本文を出さずにストリームを終了します。
-通常RESTのcancelは、空のassistant回答と同じ`dots_bridge`情報を持つHTTP 200応答です。
-
-```json
-{
-  "dots_bridge": {
-    "kind": "progress",
-    "request_id": "req_...",
-    "message_id": "received-message-id",
-    "sequence": 123
-  }
-}
-```
-
-### ResponsesのWebSocketから呼び出す
-
-同じSDKクライアントで、次のように接続できます。
+With `stream=True`, this prints progress updates and the final answer.
+For a regular JSON response containing only the final answer, use the following inside the `with` block above:
 
 ```python
-with client.responses.connect(max_retries=0) as connection:
-    connection.response.create(
-        model="dots",
-        input="今度はこちらの依頼をお願いします",
-        # previous_response_idは省略しても、指定しても構いません。
-    )
-    for event in connection:
-        if event.type == "response.output_text.delta":
-            print(event.delta, end="", flush=True)
-        elif event.type == "response.completed":
-            print()
-            break
-        elif event.type in {"error", "response.failed", "response.incomplete"}:
-            raise RuntimeError(event.to_json())
+result = client.chat.completions.create(
+    model="dots",
+    messages=[{"role": "user", "content": "Help me organize today's schedule."}],
+    stream=False,
+)
+print(result.choices[0].message.content)
 ```
 
-このブロックは上の`with OpenAI(...) as client:`の内側で実行してください。
-同じWebSocketを維持したまま`response.create`を繰り返して会話できます。
-生のWebSocketでは`ws://127.0.0.1:8766/v1/responses`へBearerヘッダー付きで接続し、次のJSONを送信します。
+SSE chunks include `dots_bridge.kind` to distinguish `progress` from `reply`.
+WebSocket output items use `phase="commentary"` for progress and `phase="final_answer"` for the final answer.
 
-```json
-{"type":"response.create","model":"dots","input":"こんにちは"}
-```
-
-`response.created`、`response.in_progress`の後、途中結果・最終回答が届くたびに標準のmessage/content/textイベントを返します。
-1回の依頼は同じresponse IDを使い、各文章を別のoutput itemとして追加します。
-途中結果のitemは`phase="commentary"`、最終回答のitemは`phase="final_answer"`です。
-途中結果の`response.output_item.done`はそのitemの完了であり、依頼全体は完了しません。
-最終回答の後に`response.completed`を1回返し、その`response.output`に途中結果と最終回答の全itemを含めます。
-失敗時の`response.failed`も、それまでに届いた途中結果を`response.output`へ保持します。
-cancel時も待機が終わるよう`response.completed`を返し、`response.status="cancelled"`、`response.output=[]`になります。
-`response.metadata`の`dots_bridge_kind="cancel"`、`dots_bridge_request_id`、`dots_bridge_superseded_by`で対象と置き換え先を識別できます。
-このcancel通知の対応付けはdots-bridge独自の拡張です。
-
-上の受信例は途中結果も表示します。最終回答だけ必要な場合は、完了応答の`response.output`から
-`item.phase == "final_answer"`のmessageだけを選び、そのcontentを使ってください。
-途中結果の受信に`dots.subscribe`は不要です。
-`stream_id`を指定すると各イベントに同じ値を返します。応答イベントは1接続内でFIFOです。
-受信した次の要求は先にdotsへ送るため、前の回答を待っている間にも置き換えを判断できます。
-異なるWebSocket接続とHTTPリクエストは並行して利用できます。
-
-対話チャットのサンプルがあります。`dots-bridge connector openai`を起動したまま、別ターミナルで実行します。
+#### Try the interactive examples
 
 ```sh
-python -m pip install 'openai[realtime]>=3.8,<4' 'prompt-toolkit>=3.0.43,<4'
 python examples/openai_client.py --mode chat
 python examples/openai_client.py --mode stream
 python examples/openai_client.py --mode websocket
 ```
 
-どのmodeも`user>`で入力してEnterで送信し、返信を`dots>`に表示します。
-`stream`と`websocket`では途中結果を`progress>`に表示します。
-`/exit`、`/quit`、Ctrl+C、Ctrl+Dで終了します。
-`prompt-toolkit`は既存の`.[chat]` extraでインストールしても構いません。
-各要求では最新の入力1件だけを送り、過去の履歴を積み直しません。会話の文脈はdots側で保持します。
+Each mode supports multiple turns. The `stream` and `websocket` modes display progress as `progress>` and final answers as `dots>`.
+WebSocket mode also shows push messages as `push>`, including while you are typing or waiting.
 
-返信待ち中にも入力してcancelを試す場合は`--interruptible`を付けます。
+#### Receive push messages over WebSocket
 
-```sh
-python examples/openai_client.py --mode stream --interruptible
-# WebSocketも同じ接続で後続要求を送れます。
-python examples/openai_client.py --mode websocket --interruptible
-```
+Ask dots to use `send_to_app` for push messages:
 
-例えば「渋谷で明日のランチ候補を調べて。途中経過も教えて」と送信し、回答待ちの間に
-「さっきの渋谷の依頼はやめて、代わりに新宿で調べて」と入力します。
-dotsが`cancel_request`を呼ぶと古い待機が表示なしで終了し、新しい要求の最終回答を待ち続けます。
-新しい要求を送っただけで自動cancelはしません。別件として送った独立した依頼は継続できます。
-直接bridgeを利用する`python examples/chat.py`も返信待ち中に入力でき、cancelを表示せず処理します。
+> When sending notifications I have requested to my application, call send_to_app with channel="default".
+> Use a unique idempotency_key for each new notification and reuse it only when retrying the same notification.
 
-エラー時は原因コード、メッセージ、要求ID、経過秒を表示します。
-SSEの途中で失敗した場合も`bridge_reply_timeout`などの原因を確認できます。
-コネクターの返信待ちは既定600秒で、途中結果が届いても延長しません。
-このサンプルのクライアント側タイムアウトは既定660秒です。
-待機時間を変更する場合はコネクターを再起動し、クライアント側の`--timeout`もそれより長く指定します。
-既定値を明示する場合は、以下をそれぞれ別ターミナルで実行します。
-
-```sh
-dots-bridge connector openai --reply-timeout 600
-python examples/openai_client.py --mode stream --timeout 660
-```
-
-`--timeout`はSDKの通信タイムアウトで、WebSocketでは1要求全体の待機時間も制限します。
-待機期限を超えても送信済みの依頼は取り消されず、自動再送もしません。
-
-最初の文章を引数で渡すと、自動送信後も対話を続けます。
-
-```sh
-python examples/openai_client.py --mode stream "こんにちは"
-```
-
-WSモードは同じ接続で何度でも会話でき、待機中・入力中の自発pushも`push>`に表示してからACKします。
-SDKの`recv_bytes()`を単一の受信ループで読み、Responsesイベントと独自の`dots.*`イベントを振り分けます。
-pushの処理位置には`--consumer-id`を使い、既定値は`example-openai`です。
-同じIDの別接続を同時に動かさず、別の受信先として使う場合はIDを変更してください。
-このサンプルのACKは表示完了を表します。実際のアプリでは必要な取り込みが成功してからACKしてください。
-
-### WebSocketで自発pushも受信する
-
-自発pushは`dots.push`イベントで通知します。途中結果・最終返信の`response.*`系列とは別で、返信を待っている間にも受信できます。
-**`type: "dots.push"`と`message.kind: "push"`で識別し、`message.request_id`は`null`になります。**
-`message.id`は受信メッセージ自身のIDで、再配信時も変わりません。
-
-WebSocket接続後、次のJSONで購読を開始してください。`response.create`を送らなくてもpushを受信できます。
+These messages do not require a preceding request or an MCP event subscription. The dots OAuth connection is required.
+Python callbacks receive them as `kind="push"`.
+To receive messages over WebSocket, send this extension event after connecting:
 
 ```json
 {"type":"dots.subscribe","consumer_id":"personal-agent"}
 ```
 
-購読成功時は`dots.subscribed`が返り、その後からpushが届きます。
-
-```json
-{
-  "type": "dots.push",
-  "consumer_id": "personal-agent",
-  "message": {
-    "id": "received-message-id",
-    "sequence": 123,
-    "kind": "push",
-    "request_id": null,
-    "channel": "default",
-    "text": "依頼されていた件について、新しい情報がありました。",
-    "metadata": {},
-    "received_at": "2026-10-22T03:00:00Z"
-  }
-}
-```
-
-パーソナルエージェントの共通文脈への取り込みなど、必要な処理が成功してからACKを返します。
+Messages arrive as `type="dots.push"` with `message.request_id=null`.
+Acknowledge each one after your application has processed it successfully:
 
 ```json
 {"type":"dots.push.ack","message_id":"received-message-id"}
 ```
 
-bridgeに処理済み位置を保存できると`dots.push.acked`を返し、次のpushへ進みます。
-一度に未ACKのpushは1件だけです。ACKが失敗した場合は`error`が返り、同じ`message_id`で再ACKできます。
-直前に成功したACKの再送は、同じ接続内では処理済み確認として扱います。
-
-| イベント | 向き | 内容 |
-| --- | --- | --- |
-| `dots.subscribe` | 利用側→コネクター | `consumer_id`を指定してpushを購読 |
-| `dots.subscribed` | コネクター→利用側 | 購読したconsumer、channel、現在のcursor |
-| `dots.push` | コネクター→利用側 | 自発メッセージ。`message`は既存の`ReceivedMessage`と同じ形式 |
-| `dots.push.ack` | 利用側→コネクター | 処理したpushの`message_id`を指定 |
-| `dots.push.acked` | コネクター→利用側 | 保存できた`message_id`と`sequence`を確認 |
-
-この`dots.*`系列は**dots-bridge独自の拡張**です。購読しない接続には送らないため、従来のResponsesクライアントもそのまま使えます。
-pushを扱う場合は、下のサンプルのように生のWebSocketでJSONを読む方法を推奨します。
-公式SDKで扱う場合も、`recv_bytes()`からJSONを読み、独自イベントを処理してください。標準イベントの型への変換は`response.*`等だけに行い、同じsocketで複数の受信ループを動かさないでください。
+Reconnect with the same consumer to resume from unacknowledged messages.
+The `dots.*` events are dots-bridge extensions.
+See [Push messages over WebSocket](docs/reference.md#push-messages-over-websocket) for the complete event format.
 
 ```sh
 python examples/websocket_push.py --consumer-id personal-agent
-# 同じsocketで依頼の返信とpushを受け取る場合
-python examples/websocket_push.py --consumer-id personal-agent --message "こんにちは"
 ```
 
-サンプルは表示後にACKし、接続を維持します。実際のアプリでは、永続的な取り込みが成功してからACKしてください。
-切断後は同じ`consumer_id`で接続・購読し直すと未ACK分を再配信します。処理後にACKが届かず切断した場合は再配信され得るので、外部への副作用は`message.id`で重複を防ぎます。
+### Replace an unfinished request
 
-`consumer_id`はLINE・電話などの会話チャネルごとではなく、受信するパーソナルエージェントに対して固定してください。
-別のIDで購読すると保存済みのpushを先頭から別途受信します。英数字と`_ . : -`の1〜118文字が使え、bridge内部のconsumerは`openai-ws:<consumer_id>`です。
-channelはコネクター起動時の`--channel`に固定されます。同じconsumerでchannelを変更しないでください。
-同じコネクタープロセス内では、同じconsumerの同時購読は409で拒否します。別プロセスのコネクター同士でも同じconsumerを同時に使わないでください。
-このpush専用consumerでは、依頼に紐づく`progress`・`reply`・`cancel`を読み飛ばしてACKします。
-他のconsumerの処理位置には影響しません。
+For a message such as "Stop the earlier search and look into this instead", dots can close the old request using `cancel_request`.
+Sending a newer request does not cancel anything automatically. Dots uses cancel only for a clear replacement and continues independent requests.
 
-### 互換範囲
+```sh
+python examples/openai_client.py --mode stream --interruptible
+python examples/openai_client.py --mode websocket --interruptible
+```
 
-- テキスト会話の入出力に対応します。Chatの`messages`、Responsesの配列形式`input`では、**最新の`role: user`の1件だけ**を転送します。文字列の`input`はそのまま転送します。
-- 過去の履歴、system/developerメッセージ、`instructions`、`previous_response_id`、入力側の`response_id`は転送・復元しません。会話の文脈はdots側で継続します。
-- `model`は互換クライアント用の名前です。別名でも同じdotsへ届き、モデルを切り替えません。temperatureやトークン上限などの生成設定は無視します。
-- 画像・音声・ファイル、クライアント指定のtools、構造化出力、複数候補、warmup、steering、ResponsesのHTTP APIや保存済み応答の取得は未対応です。最新のメッセージが非テキストや空の場合はエラーにし、古い依頼を代わりに送信しません。
-- WebSocketは`response.create`に対する返信に加え、独自の`dots.subscribe`による自発push購読に対応します。pushはResponsesの完了イベントに混ぜず、利用側からの明示ACKで処理済みにします。
-- 通常RESTは最終回答のみ、SSEとResponses WebSocketは途中結果も返します。途中結果は完了扱いにせず、最終回答またはcancelで依頼を閉じます。
-- 接続が切れたり待機がタイムアウトしても、送信済みのdotsへの依頼は継続します。HTTP応答の`X-Dots-Request-ID`、エラー内の`request_id`、WS完了・失敗応答の`metadata.dots_bridge_request_id`で状態を調べられます。
-- コネクターは依頼を自動再送しません。HTTPエラーでは公式SDK向けに`x-should-retry: false`を返します。切断後も再送を避けたい場合は呼び出し側で自動再試行を無効にし、HTTPでは同じ`Idempotency-Key`ヘッダーを付けて再実行できます（128文字以内）。
-- 入力全体は300 KiB、転送する最新のテキストは16,000文字までです。WSは処理中の1件に加え16件まで待機できます。ブラウザーからの異なるoriginへのアクセスは許可しません。
+`--interruptible` lets you submit another request before the final answer arrives.
+The examples handle cancellation silently. The direct `examples/chat.py` example also accepts input while waiting.
 
-Pythonアプリから直接起動する場合は、`dots_bridge.connectors.create_openai_connector(bridge_url, api_key=...)`がStarletteアプリを返します。
-コネクターを提供するためのOpenAI SDKやOpenAI APIキーは不要です。
-プロトコルは公式の[Chat Completionsストリーミング仕様](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)と[Responses WebSocket仕様](https://developers.openai.com/api/docs/guides/websocket-mode)を参照しています。
-
-## HTTP API
-
-`/api/*`には`Authorization: Bearer <api_key>`が必要です。JSONのみ受け付けます。
-
-| メソッド・パス | 内容 |
+| Receive method | On cancellation |
 | --- | --- |
-| `GET /health` | 認証不要のプロセス稼働確認 |
-| `GET /api/subscriptions` | 有効な購読のID、channel、期限。callbackやsecretは返さない |
-| `POST /api/messages` | 依頼を保存して202を返す |
-| `GET /api/messages/{request_id}` | 配送状態と保存済みの最終返信を取得 |
-| `GET /api/messages/{request_id}/responses?after=0&limit=100` | その依頼の途中結果・最終返信・cancelを保存順で取得 |
-| `DELETE /api/subscriptions/{subscription_id}` | 購読を解除し、未配送依頼をキャンセル |
-| `GET /api/received?after=0&limit=100&channel=default` | 途中結果・最終返信・cancel・自発メッセージの受信一覧（channelは省略可能） |
-| `GET /api/consumers/{consumer_id}?channel=default` | consumerの処理位置を取得・初期化 |
-| `POST /api/consumers/{consumer_id}/ack` | `{"sequence": 123, "channel": "default"}`で処理位置を進める |
+| `on_received` / `iter_responses` | Receive `kind="cancel"`, the old `request_id`, and its `superseded_by` ID |
+| `ask()` / `wait_for_reply()` | End the wait with `RequestCancelledError` |
+| Chat Completions REST / SSE | Empty content with `dots_bridge.kind="cancel"`, followed by normal completion |
+| Responses WebSocket | `response.completed`, `response.status="cancelled"`, and empty `output` |
 
-受信一覧・依頼ごとの応答一覧の戻り値は`{"messages": [...]}`、consumer操作の戻り値は`{"cursor": 123}`です。
-`after`は指定番号よりあとの受信、`limit`は1〜100件です。
-依頼ごとの応答一覧は`progress`・`reply`・`cancel`を返し、依頼が存在しない場合は404です。
-通常はクライアントのバックグラウンド受信が一覧取得とACKを行います。
-手動で扱う場合は同期・非同期クライアントの`list_received()`、`get_consumer_cursor()`、`acknowledge_received()`を使えます。
-受信一覧の取得だけでは処理位置は進みません。
-依頼ごとの一覧取得には同期・非同期クライアントの`list_response_messages()`、最終回答までの逐次受信には非同期クライアントの`iter_responses()`も使えます。
+Clean up any waiters or temporary buffers associated with the old `request_id`.
+Cancel closes the bridge's reply wait. It does not undo completed actions or forcibly stop the dot's execution environment.
 
-送信JSONは次の形です。`text`以外は省略可能です。
+### CLI and HTTP API
 
-```json
-{
-  "text": "こんにちは",
-  "channel": "default",
-  "subscription_id": "sub_...",
-  "metadata": {"source": "my-app"},
-  "idempotency_key": "my-request-001"
-}
+```sh
+dots-bridge subscriptions
+dots-bridge send "Connection test. Please send a short reply." --wait --timeout 600
+dots-bridge get req_...
 ```
 
-戻り値には`request_id`、`event_id`、`delivery_status`、`reply_status`、`reply`などが含まれます。
+`send` normally returns as soon as the request is stored. Add `--wait` to wait for the final answer.
+With your own HTTP client, submit requests through `POST /api/messages` and retrieve results through
+`GET /api/messages/{request_id}` or `GET /api/received`.
+See the [HTTP API reference](docs/reference.md#http-api) for authentication, payloads, and all endpoints.
 
-| フィールド | 値・意味 |
+### Examples
+
+| File | Purpose |
 | --- | --- |
-| `delivery_status` | `queued` / `delivering` / `accepted` / `failed` / `cancelled` |
-| `reply_status` | `pending` / `replied` / `expired` / `cancelled` |
-| `reply` | 保存済みの最終返信。未返信時は`null` |
-| `superseded_by` / `cancelled_at` | 置き換えによるcancel時だけ返す、後続要求IDと取消日時 |
-| `attempts` | Webhookの試行回数 |
-| `status_code` | 最後に得たWebhookのHTTPステータス |
-| `error` | 秘密情報を含まないエラーコード。成功時は`null` |
+| [examples/chat.py](examples/chat.py) | Interactive chat connected directly to the bridge |
+| [examples/send_message.py](examples/send_message.py) | Async submission and message callbacks |
+| [examples/openai_client.py](examples/openai_client.py) | REST, SSE, and WebSocket chat using the official OpenAI SDK |
+| [examples/websocket_push.py](examples/websocket_push.py) | Receive and acknowledge push messages with a raw WebSocket |
+| [examples/app.py](examples/app.py) | Run the bridge as an ASGI application |
+| [examples/embedded.py](examples/embedded.py) | Receive callbacks inside the server process |
 
-**202は保存完了、`accepted`はdots側WebhookのHTTP受付を表します。**
-dotsの処理完了・回答生成を示すのは`reply_to_app`で返信が保存され、`reply_status`が`replied`になった段階です。
-`report_progress`を呼んでも`reply_status`は`pending`のままです。
+`chat.py` and `send_message.py` share the `example-app` consumer, so running them in sequence preserves the processing position.
+To run them simultaneously, change the chat's `--consumer-id`. The OpenAI example's WebSocket mode defaults to `example-openai`.
+Interactive examples read `bridge.toml` from the repository root by default. Use `--config` to select another file.
 
-## 既存ASGIアプリへの組み込み
+<a id="configuration"></a>
 
-FastAPIは必須依存にしていません。StarletteのASGIアプリとして起動・組み込みできます。
+## 🔧 Configuration
 
-```python
-from dots_bridge import Settings, create_app
+### Configuration file
 
-app = create_app(Settings.from_file("bridge.toml"))
-```
+The CLI reads **`bridge.toml` in the current directory** by default. Use `--config` for another location.
 
 ```sh
-uvicorn main:app --host 127.0.0.1 --port 8765 --workers 1 --no-access-log
+dots-bridge serve --config /path/to/bridge.toml
+dots-bridge connector openai --config /path/to/bridge.toml
 ```
 
-ライフサイクルの開始で配送workerが動き、終了で停止します。
-他のASGIアプリへmountする場合は、このアプリのlifespanも呼び出してください。
-OAuthのwell-knownと運用エンドポイントを公開originのルートから利用できるようにする必要があります。
-最初は独立したサーバーとして動かす構成を推奨します。
+`init` generates the configuration below, including all required keys.
 
-## 保存・再送・運用上の範囲
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `public_base_url` | Set by `init --public-url` | Public HTTPS origin, without a path such as `/mcp` |
+| `redirect_uri` | Empty | Exact OAuth callback URL shown during dots registration |
+| `client_id` | `dots-bridge` | Registered OAuth client ID |
+| `owner_user_id` | `owner` | Owner ID returned by the connection check tool |
+| `owner_key` | Generated | Owner key entered on the OAuth consent page |
+| `api_key` | Generated | Bearer key for applications and the connector |
+| `storage_key` | Generated | Encrypts stored webhook callback URLs and secrets |
+| `db_path` | `data/bridge.sqlite3` | SQLite file path, relative to the configuration file |
+| `host` | `127.0.0.1` | Bridge bind address |
+| `port` | `8765` | Bridge bind port |
+| `subscription_ttl_seconds` | `86400` | Default and maximum subscription lifetime, in seconds |
+| `reply_timeout_seconds` | `3600` | Time from request creation during which progress and final replies are accepted |
+| `max_delivery_attempts` | `5` | Maximum webhook delivery attempts |
+| `retry_base_seconds` | `1.0` | Base delay for exponential delivery backoff, in seconds |
+| `worker_interval_seconds` | `0.5` | Maximum interval between delivery queue checks, in seconds |
 
-- **単一所有者向けです。** 複数テナント・一般公開の本人確認基盤は提供しません。
-- 設定はTOML、購読、依頼、配送状態、途中結果・最終返信・自発メッセージ、受信処理位置、OAuth状態はSQLiteに保存します。
-  OAuthアクセストークンは1時間、refresh tokenは30日です。再起動で接続状態を失いません。
-- 既存dots-bridgeのschema 1〜4は、次回bridge起動時に同一トランザクションでschema 5へ自動移行します。
-  保存済みの受信ID・sequence・consumerの処理位置を維持します。コネクターはDBを直接操作しません。
-- Webhookのcallback URLとsecretはFernetで暗号化します。本文・返信・metadataを含むDB全体の暗号化は行いません。
-  DB・設定・バックアップは所有者のみ読める場所に置いてください。
-- callbackを署名付きチャレンジで検証し、Standard Webhooksで署名します。
-  HTTPS・公開IPのみ許可し、DNSで検証したIPへ固定接続します。redirect・環境proxyは使いません。
-- ネットワーク障害、408、425、429、5xxは回数制限付きで再試行します。410・413などの恒久エラーは再試行しません。
-  410では購読を削除します。同じイベントIDと本文を維持し、試行ごとに署名を作り直します。
-- サーバー停止後の未配送は起動時に再開します。送信中に停止した場合は30秒のlease期限後に再開します。
-  受付後に通信が切れた場合は重複配信し得ます。dots側の副作用にも冪等性を持たせてください。
-- 最終返信は依頼ごとに1つです。同じ本文の再呼び出しは成功し、違う本文の再返信は拒否します。
-  途中結果は`report_progress`で複数回保存でき、SSE/WSやアプリの受信処理へ順に渡します。
-  dotsの生成トークンの逐次取得や、会話ログの自動取得は提供しません。
-- 有効な購読に対して送信します。送信時に購読がなければ409です。
-  解除・失効・明示的なOAuth取消後は未配送を止めます。既に開始したHTTP要求は取り消せません。
-- イベント履歴のMCP cursor replayは提供せず、`cursor: null`を返します。
-  内部outboxの再送と、MCPの履歴再生は別の機能です。`ttlMs: null`でも有限の購読期限を返します。
-- このパッケージが保存するのは`report_progress`・`reply_to_app`・`send_to_app`へ渡された本文です。
-  dotsがツールを必ず呼ぶこと、即時に処理されることは保証できません。
-  dotsへの依頼で返信・通知方法を明示してください。
-- 受信一覧とconsumerの処理位置は`prune`で削除しません。依頼を削除しても未処理の途中結果・最終返信を受信一覧から取得できます。
-  長期運用時はDB容量も確認してください。
+Restart the affected processes after changing settings.
+`bridge.toml` is created with mode 0600 and is excluded from Git in this repository.
+Keep `storage_key` for as long as you use the database. The server refuses to use an existing database with a different storage key.
 
-明示的にOAuth接続と購読を全て取り消す場合:
+You can override the three keys with environment variables. `.env` files are not loaded automatically.
+
+- `DOTS_BRIDGE_OWNER_KEY`
+- `DOTS_BRIDGE_API_KEY`
+- `DOTS_BRIDGE_STORAGE_KEY`
+
+The Python examples load the configuration file for local convenience.
+An external application only needs the bridge URL and `api_key`.
+
+### Connector options
+
+Configure the connector through CLI arguments:
 
 ```sh
-dots-bridge revoke --config bridge.toml
+dots-bridge connector openai \
+  --url http://127.0.0.1:8765 \
+  --host 127.0.0.1 --port 8766 \
+  --channel default --reply-timeout 600
 ```
 
-古い完了済みメッセージを削除する場合:
+| Option | Default | Purpose |
+| --- | --- | --- |
+| `--config` | `bridge.toml` | Credentials and bridge connection settings |
+| `--url` | Derived from configuration `host` / `port` | Bridge URL |
+| `--host` / `--port` | `127.0.0.1` / `8766` | Connector bind address and port |
+| `--channel` | `default` | Channel for requests and push messages |
+| `--subscription-id` | Omitted | Explicit destination subscription |
+| `--reply-timeout` | `600` | Total reply wait per request, in seconds; progress does not extend it |
+
+If multiple subscriptions are active on the same channel, select one with `--subscription-id`.
+Python submission also accepts `channel` and `subscription_id`. One subscription on `default` is enough to get started.
+
+### Request lifetime and wait timeouts
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| Bridge `reply_timeout_seconds` | 3600 seconds | Request lifetime for accepting responses from dots |
+| Python `ask()` / `wait_for_reply()` / `iter_responses()` | 120 seconds | Caller wait budget; pass `timeout=600` or another value as needed |
+| CLI `send --timeout` | 120 seconds | Wait budget when using `--wait` |
+| Connector `--reply-timeout` | 600 seconds | Reply wait for a REST/SSE/WS request |
+| OpenAI example `--timeout` | 660 seconds | SDK network timeout; also bounds a complete request in WS mode |
+
+Research tasks can take several minutes. Set the caller's timeout longer than the connector's reply timeout.
+Progress updates do not extend the wait. A wait timeout does not cancel an already submitted request.
+
+<a id="operations"></a>
+
+## 🛠️ Operations
+
+- **Start and stop** — The bridge and connector run in the foreground. Stop each with Ctrl+C. Run the bridge with one worker.
+- **Persistence** — SQLite stores requests, receipts, OAuth state, subscriptions, and consumer checkpoints. Pending deliveries resume after a restart.
+- **Backups** — Keep the configuration and SQLite database. Message bodies, replies, and metadata are not encrypted at rest by the bridge.
+- **Tool updates** — After changing MCP tools, restart the bridge and connector, then rescan tools and events in dots.
+- **Subscriptions** — Use `dots-bridge subscriptions` to check active subscriptions and their expiry. Ask dots to subscribe again if one has expired.
+
+The connector logs request acceptance, progress, completion, and errors.
+Use `request_id`, `elapsed`, and `reply_timeout` to trace a request.
+Message bodies, credentials, and destination URLs are not logged.
+
+| Symptom | Check |
+| --- | --- |
+| Submission fails or no subscription exists | Run `subscriptions` and ask the connected dot to subscribe to `app.message.created` |
+| Delivery is `accepted` but no answer arrives | Processing after webhook acceptance is asynchronous. Check `reply_status`, execution in dots, and reply tool calls |
+| `bridge_reply_timeout` | The connector's reply wait expired. Check the request by ID and adjust wait settings if needed |
+| `bridge_unavailable` | Check connectivity to the bridge and the log's `error_type` |
+| Old messages appear again | Check whether you changed `consumer_id`. Reuse the same ID to preserve the checkpoint |
+| No progress or cancel messages | Rescan tools in dots and explain when to use them. Normal final answers use `reply_to_app` |
+
+Remove old completed requests with:
 
 ```sh
-dots-bridge prune --days 30 --config bridge.toml
+dots-bridge prune --days 30
 ```
 
-## 開発・検証
+This leaves receipts and consumer checkpoints intact. Monitor database size during long-running use.
+To revoke all OAuth credentials and subscriptions, use `dots-bridge revoke`.
+See [Storage, delivery, and operations](docs/reference.md#storage-delivery-and-operations) for delivery and retention details.
+
+<a id="development"></a>
+
+## 🧪 Development
 
 ```sh
 python -m pip install -e '.[dev]'
@@ -784,26 +603,8 @@ ruff format --check .
 python -m build
 ```
 
-テストは一時SQLiteと偽callbackを使い、実際のdotsや本番の秘密情報へ接続しません。
-OAuthの認可・更新・取消、実際のFastMCP HTTP経由の発見とツール呼び出し、
-署名・SSRF対策、再送、再起動、依頼と返信の相関を検証します。
+Automated tests use temporary SQLite databases and fake callbacks. They do not connect to dots or production credentials.
+Install a built wheel with `python -m pip install dist/dots_bridge-0.6.0-py3-none-any.whl`. Publishing to PyPI is a separate step.
 
-実際のdotsとの動作確認は別途、接続→購読→アプリ送信→dots処理→返信取得→解除を一通り行ってください。
-本リポジトリーの自動テストだけでは、対象アカウントの機能可否や長期的なdots側の自動更新までは確認できません。
-
-## 実装と参照元
-
-MCP 2.0（`2026-07-28`）、HTTP transport、ツールのスキーマ・呼び出し、OAuthの標準エンドポイントは
-FastMCP 4.1以降とMCP Python SDKに任せています。
-このパッケージではdraft Eventsの3メソッドをFastMCPの`ServerExtension`で追加しています。
-現在のSDKが`capabilities.events`を落とす問題と、OpenAIのツール認証メタデータの互換処理は、
-小さなmiddlewareとして`mcp.py`に分離してあります。
-
-- [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events)
-- [OpenAI Authentication](https://developers.openai.com/plugins/build/auth)
-- [FastMCP MCP 2.0対応](https://github.com/PrefectHQ/fastmcp/blob/main/dev-docs/v4-notes/protocol-2026.md)
-- [FastMCP Extensions](https://github.com/PrefectHQ/fastmcp/blob/main/fastmcp_slim/fastmcp/server/extensions.py)
-- [MCP SDKのEvents capabilityに関するissue](https://github.com/modelcontextprotocol/python-sdk/issues/3640)
-
-設計の参照元はAIAvatarKitの`dots_tool/mcp_events`プロトタイプです。
-既存プロトタイプのSQLite形式とは互換ではありません。新しいDBで接続・購読し直してください。
+The bridge uses FastMCP and the MCP Python SDK for MCP/OAuth, and Starlette for the HTTP application.
+See the [Technical Reference](docs/reference.md) for ASGI integration and protocol sources.
