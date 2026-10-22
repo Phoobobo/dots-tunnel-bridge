@@ -164,7 +164,7 @@ def connector_server(monkeypatch):
 
 def test_openai_connector_defaults_are_separate_from_bridge_server(config, connector_server):
     sentinel, seen = connector_server
-    assert cli.main(["openai", "--config", str(config)]) == 0
+    assert cli.main(["connector", "openai", "--config", str(config)]) == 0
     assert seen == [
         (
             "factory",
@@ -190,16 +190,19 @@ def test_openai_connector_defaults_are_separate_from_bridge_server(config, conne
     ]
 
 
-@pytest.mark.parametrize("global_url", [False, True])
-def test_openai_connector_passes_explicit_arguments(config, connector_server, global_url):
+@pytest.mark.parametrize("option_position", ["root", "connector", "openai"])
+def test_openai_connector_passes_explicit_arguments(config, connector_server, option_position):
     sentinel, seen = connector_server
-    url_arguments = ["--url", "http://127.0.0.1:9000"]
-    arguments = ["--config", str(config)]
-    if global_url:
-        arguments += url_arguments
+    connection_arguments = ["--config", str(config), "--url", "http://127.0.0.1:9000"]
+    arguments = []
+    if option_position == "root":
+        arguments += connection_arguments
+    arguments += ["connector"]
+    if option_position == "connector":
+        arguments += connection_arguments
     arguments += ["openai"]
-    if not global_url:
-        arguments += url_arguments
+    if option_position == "openai":
+        arguments += connection_arguments
     arguments += [
         "--host", "0.0.0.0",
         "--port", "9001",
@@ -238,7 +241,7 @@ def test_openai_connector_default_bridge_url_uses_bridge_configuration(
 ):
     settings = Settings.from_file(config).model_copy(update={"host": "::", "port": 9000})
     monkeypatch.setattr(Settings, "from_file", lambda path: settings)
-    assert cli.main(["openai", "--config", str(config)]) == 0
+    assert cli.main(["connector", "openai", "--config", str(config)]) == 0
     assert connector_server[1][0][1] == "http://127.0.0.1:9000"
     assert connector_server[1][1][2]["port"] == 8766
 
@@ -250,19 +253,40 @@ def test_openai_connector_rejects_invalid_ports_before_loading_configuration(por
 
     monkeypatch.setattr(Settings, "from_file", fail_load)
     with pytest.raises(SystemExit) as caught:
-        cli.main(["openai", "--port", port])
+        cli.main(["connector", "openai", "--port", port])
     assert caught.value.code == 2
 
 
 @pytest.mark.parametrize("port", [1, 65535])
 def test_openai_connector_accepts_port_boundaries(port):
-    assert cli._parser().parse_args(["openai", "--port", str(port)]).port == port
+    assert cli._parser().parse_args(["connector", "openai", "--port", str(port)]).port == port
 
 
 @pytest.mark.parametrize("duration", ["0", "-1", "nan", "inf"])
 def test_openai_connector_rejects_invalid_reply_timeout(duration):
     with pytest.raises(SystemExit) as caught:
-        cli.main(["openai", "--reply-timeout", duration])
+        cli.main(["connector", "openai", "--reply-timeout", duration])
+    assert caught.value.code == 2
+
+
+def test_openai_connector_loads_default_configuration_from_working_directory(
+    config, connector_server, monkeypatch
+):
+    monkeypatch.chdir(config.parent)
+    assert cli.main(["connector", "openai"]) == 0
+    assert connector_server[1][0][2]["api_key"] == Settings.from_file(config).api_key
+
+
+@pytest.mark.parametrize("arguments", [["connector"], ["connector", "unknown"], ["openai"]])
+def test_connector_requires_a_known_nested_command_before_loading_configuration(
+    arguments, monkeypatch
+):
+    def fail_load(path):
+        raise AssertionError("Configuration should not be loaded")
+
+    monkeypatch.setattr(Settings, "from_file", fail_load)
+    with pytest.raises(SystemExit) as caught:
+        cli.main(arguments)
     assert caught.value.code == 2
 
 

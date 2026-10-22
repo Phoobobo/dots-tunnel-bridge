@@ -1,6 +1,6 @@
 """Receive spontaneous dots pushes and Responses replies on one WebSocket.
 
-Start ``dots-bridge openai --config bridge.toml`` in another terminal.
+Start ``dots-bridge connector openai`` in another terminal.
 Use the same consumer ID when reconnecting to resume unacknowledged pushes.
 """
 

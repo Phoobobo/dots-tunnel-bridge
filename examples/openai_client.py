@@ -1,6 +1,6 @@
 """Call the standalone connector with the official OpenAI Python SDK.
 
-Run ``dots-bridge openai --config bridge.toml`` in another terminal first.
+Run ``dots-bridge connector openai`` in another terminal first.
 Install the caller's SDK with ``pip install 'openai[realtime]>=3.8,<4'``.
 """
 

@@ -45,8 +45,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", help="Bridge HTTP URL for application commands")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    def command(name: str, help_text: str, *, remote: bool = False):
-        sub = commands.add_parser(name, help=help_text)
+    def command(name: str, help_text: str, *, remote: bool = False, group=commands):
+        sub = group.add_parser(name, help=help_text)
         sub.add_argument("--config", default=argparse.SUPPRESS, help="Configuration file")
         if remote:
             sub.add_argument("--url", default=argparse.SUPPRESS, help="Bridge HTTP URL")
@@ -55,7 +55,11 @@ def _parser() -> argparse.ArgumentParser:
     init = command("init", "Create a private configuration with generated keys")
     init.add_argument("--public-url", required=True, help="Public HTTPS origin, without /mcp")
     command("serve", "Run the bridge HTTP and MCP server")
-    openai = command("openai", "Run the OpenAI-compatible connector", remote=True)
+    connector = command("connector", "Run a client-side protocol connector", remote=True)
+    connectors = connector.add_subparsers(dest="connector", required=True)
+    openai = command(
+        "openai", "Serve Chat Completions and Responses WebSocket", remote=True, group=connectors
+    )
     openai.add_argument("--host", default="127.0.0.1", help="Connector bind host")
     openai.add_argument(
         "--port", type=_port, default=8766, help="Connector bind port (default: 8766)"
@@ -148,7 +152,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 access_log=False,
             )
             return 0
-        if args.command == "openai":
+        if args.command == "connector" and args.connector == "openai":
             import uvicorn
 
             from .connectors.openai import create_openai_connector

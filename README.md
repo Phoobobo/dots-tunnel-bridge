@@ -312,19 +312,22 @@ asyncio.run(main())
 
 ## OpenAI互換コネクター
 
-既存bridgeのHTTPクライアントとして動く、独立したASGIアプリです。
+`dots-bridge serve`はbridge本体を起動します。
+`dots-bridge connector openai`は既存bridgeへHTTP接続するコネクターだけを別プロセスで起動します。
 MCPサーバーへのルート追加やDB更新は不要です。bridgeとngrokはそのまま動かし、別ターミナルで起動します。
 
 ```sh
-dots-bridge openai --config bridge.toml
+dots-bridge connector openai
 ```
 
-既定の待受は`127.0.0.1:8766`です。利用側は`bridge.toml`の`api_key`でBearer認証します。
+`--config`を省略すると、カレントディレクトリーの`bridge.toml`を読みます。
+既定の待受は`127.0.0.1:8766`で、1つのコネクターが同じポートでChat CompletionsのREST/SSEとResponsesのWebSocketを提供します。
+利用側は`bridge.toml`の`api_key`でBearer認証します。
 このキーはbridgeへの呼び出しにも使われ、OpenAIのAPIキーではありません。
 接続先bridgeのURLは設定の`host` / `port`から求めます。別ホストの場合は`--url`で指定します。
 
 ```sh
-dots-bridge openai --config bridge.toml \
+dots-bridge connector openai --config /path/to/bridge.toml \
   --url http://127.0.0.1:8765 --host 127.0.0.1 --port 8766 \
   --channel default --reply-timeout 600
 ```
