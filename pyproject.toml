@@ -7,6 +7,9 @@ name = "dots-bridge"
 version = "0.6.0"
 description = "An HTTP and MCP Events bridge between external applications and OpenAI dots"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "uezo", email = "uezo@uezo.net" }]
 requires-python = ">=3.11"
 dependencies = [
   "anyio>=4,<5",
@@ -27,6 +30,11 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Topic :: Communications",
 ]
+
+[project.urls]
+Homepage = "https://github.com/uezo/dots-bridge"
+Repository = "https://github.com/uezo/dots-bridge"
+Issues = "https://github.com/uezo/dots-bridge/issues"
 
 [project.optional-dependencies]
 chat = ["prompt-toolkit>=3.0.43,<4"]
