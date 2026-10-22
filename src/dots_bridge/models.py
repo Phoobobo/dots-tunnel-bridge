@@ -74,7 +74,7 @@ class CancellationInput(BaseModel):
 
 
 class ReceivedMessage(BaseModel):
-    """One durable final reply, intermediate result, or proactive message from dots."""
+    """One durable final reply, intermediate result, or push message from dots."""
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 

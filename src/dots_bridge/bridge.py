@@ -72,7 +72,7 @@ class DotsBridge:
             self._worker = None
 
     def on_received(self, handler):
-        """Register a sync or async handler for replies and unsolicited messages.
+        """Register a sync or async handler for replies and push messages.
 
         Register before the application's lifespan starts to start receiving
         automatically, or call start_receiving() explicitly.
@@ -460,7 +460,7 @@ class DotsBridge:
         channel: str = "default",
         metadata: dict | None = None,
     ) -> dict:
-        """Persist an unsolicited dots message independently of request/reply state."""
+        """Persist a dots push message independently of request/reply state."""
         try:
             message = PushInput(
                 text=text,

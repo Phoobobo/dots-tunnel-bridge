@@ -407,7 +407,7 @@ class AsyncBridgeClient:
         return self._receiver.error
 
     def on_received(self, handler: ReceivedHandler) -> ReceivedHandler:
-        """Register a callback for both replies and unsolicited messages from dots."""
+        """Register a callback for both replies and push messages from dots."""
         return self._receiver.on_received(handler)
 
     async def start_receiving(

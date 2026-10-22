@@ -1,4 +1,4 @@
-"""Durable, ordered dispatch of replies and unsolicited messages from dots."""
+"""Durable, ordered dispatch of replies and push messages from dots."""
 
 from __future__ import annotations
 
