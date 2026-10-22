@@ -74,13 +74,32 @@ class Store:
                 "storage_error", "Could not access the bridge database.", 500
             ) from None
 
+    @staticmethod
+    def _enable_wal(db: sqlite3.Connection) -> None:
+        # Concurrent first opens can fail the journal-mode lock upgrade without
+        # waiting for busy_timeout. Retry only this idempotent setup statement.
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                db.execute("PRAGMA journal_mode=WAL")
+                return
+            except sqlite3.OperationalError as error:
+                if getattr(error, "sqlite_errorcode", None) != sqlite3.SQLITE_BUSY:
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise
+                time.sleep(min(0.01, remaining))
+                if time.monotonic() >= deadline:
+                    raise
+
     async def initialize(self):
         async with self._lock:
             if self._ready:
                 return
 
             def setup(db):
-                db.execute("PRAGMA journal_mode=WAL")
+                self._enable_wal(db)
                 db.executescript(SCHEMA)
                 db.execute("BEGIN IMMEDIATE")
                 version = db.execute("SELECT value FROM bridge_meta WHERE key='schema'").fetchone()
