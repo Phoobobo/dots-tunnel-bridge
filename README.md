@@ -24,7 +24,8 @@ sequenceDiagram
     App->>Bridge: 成功した処理位置をACK
 ```
 
-WebSocketは使いません。dotsへの配信はHTTPS POST、外部アプリの受信はバックグラウンドのHTTPポーリングです。
+dotsへの配信はHTTPS POST、外部アプリの受信はバックグラウンドのHTTPポーリングです。
+OpenAI互換コネクターを別プロセスで起動すると、利用側からChat Completions形式のREST APIとResponses形式のWebSocketでも呼び出せます。
 `@bridge.on_received`で受信時の処理を登録でき、送信と受信を独立して動かせます。
 `ask()`で送信した依頼の返信を待つこともできます。
 OpenAI APIキーは不要です。dots側でMCPサーバーへOAuth接続し、外部アプリからdotsへ送る場合はイベントも購読します。
@@ -44,7 +45,7 @@ wheelも作成できます。PyPIへの公開は別途行う作業です。
 ```sh
 python -m pip install build
 python -m build
-python -m pip install dist/dots_bridge-0.2.0-py3-none-any.whl
+python -m pip install dist/dots_bridge-0.3.0-py3-none-any.whl
 ```
 
 ## サーバーの起動
@@ -308,6 +309,125 @@ asyncio.run(main())
 タイムアウト後も依頼と返信はDBに残り、`get_message(request_id)`で確認できます。
 クライアントの待機期限と、サーバーの`reply_timeout_seconds`は別の期限です。
 同期版はHTTPXの通信操作ごとのタイムアウトを併用します。通信中も含む厳密な待機時間制限が必要なら非同期版を利用してください。
+
+## OpenAI互換コネクター
+
+既存bridgeのHTTPクライアントとして動く、独立したASGIアプリです。
+MCPサーバーへのルート追加やDB更新は不要です。bridgeとngrokはそのまま動かし、別ターミナルで起動します。
+
+```sh
+dots-bridge openai --config bridge.toml
+```
+
+既定の待受は`127.0.0.1:8766`です。利用側は`bridge.toml`の`api_key`でBearer認証します。
+このキーはbridgeへの呼び出しにも使われ、OpenAIのAPIキーではありません。
+接続先bridgeのURLは設定の`host` / `port`から求めます。別ホストの場合は`--url`で指定します。
+
+```sh
+dots-bridge openai --config bridge.toml \
+  --url http://127.0.0.1:8765 --host 127.0.0.1 --port 8766 \
+  --channel default --reply-timeout 600
+```
+
+同じbridge channelに複数のsubscriptionがある場合は`--subscription-id`も指定してください。
+呼び出し側のタイムアウトは`--reply-timeout`より長く設定してください。
+コネクターには追加DBやconsumer IDが不要です。返信を`request_id`で照合し、受信カーソルを進めないため、既存の`on_received`と併用できます。
+
+| 入口 | 対応内容 |
+| --- | --- |
+| `POST /v1/chat/completions` | Chat Completions形式のJSON応答、`stream: true`でSSE |
+| `GET /v1/models` | モデル名`dots`を返す一覧 |
+| `WS /v1/responses` | `response.create`を受け付け、Responses形式のイベントを返す |
+| `GET /health` | コネクター自身の生存確認。bridgeへの接続確認ではない |
+
+### Chat Completionsから呼び出す
+
+公式Python SDKを利用する場合は、呼び出し側の環境にインストールします。
+
+```sh
+python -m pip install 'openai[realtime]>=3.8,<4'
+```
+
+```python
+from openai import OpenAI
+from dots_bridge import Settings
+
+settings = Settings.from_file("bridge.toml")
+with OpenAI(
+    base_url="http://127.0.0.1:8766/v1",
+    api_key=settings.api_key,
+    timeout=180,
+    max_retries=0,
+) as client:
+    result = client.chat.completions.create(
+        model="dots",
+        messages=[
+            {"role": "user", "content": "以前の依頼"},
+            {"role": "assistant", "content": "以前の応答"},
+            {"role": "user", "content": "この依頼だけをdotsに送ってください"},
+        ],
+    )
+    print(result.choices[0].message.content)
+```
+
+`stream=True`も使用できます。dotsの返信は完成後に届くため、assistant role、全文のcontent、終了の順で返します。
+待機中はSSEのコメントを送り、トークン数・料金は取得できないためusageを推定しません。
+
+### ResponsesのWebSocketから呼び出す
+
+同じSDKクライアントで、次のように接続できます。
+
+```python
+with client.responses.connect(max_retries=0) as connection:
+    connection.response.create(
+        model="dots",
+        input="今度はこちらの依頼をお願いします",
+        # previous_response_idは省略しても、指定しても構いません。
+    )
+    for event in connection:
+        if event.type == "response.output_text.delta":
+            print(event.delta, end="", flush=True)
+        elif event.type == "response.completed":
+            print()
+            break
+        elif event.type in {"error", "response.failed", "response.incomplete"}:
+            raise RuntimeError(event.to_json())
+```
+
+このブロックは上の`with OpenAI(...) as client:`の内側で実行してください。
+同じWebSocketを維持したまま`response.create`を繰り返して会話できます。
+生のWebSocketでは`ws://127.0.0.1:8766/v1/responses`へBearerヘッダー付きで接続し、次のJSONを送信します。
+
+```json
+{"type":"response.create","model":"dots","input":"こんにちは"}
+```
+
+`response.created`、`response.in_progress`の後、返信が届くとmessage/content/textの各イベントと`response.completed`を返します。
+応答IDはコネクターが発行し、各応答内で一貫させます。`stream_id`を指定すると各イベントに同じ値を返しますが、処理は1接続内でFIFOです。
+異なるWebSocket接続とHTTPリクエストは並行して利用できます。
+
+実行できるサンプルもあります。
+
+```sh
+python examples/openai_client.py --mode chat "こんにちは"
+python examples/openai_client.py --mode stream "こんにちは"
+python examples/openai_client.py --mode websocket "こんにちは"
+```
+
+### 互換範囲
+
+- テキスト会話の入出力に対応します。Chatの`messages`、Responsesの配列形式`input`では、**最新の`role: user`の1件だけ**を転送します。文字列の`input`はそのまま転送します。
+- 過去の履歴、system/developerメッセージ、`instructions`、`previous_response_id`、入力側の`response_id`は転送・復元しません。会話の文脈はdots側で継続します。
+- `model`は互換クライアント用の名前です。別名でも同じdotsへ届き、モデルを切り替えません。temperatureやトークン上限などの生成設定は無視します。
+- 画像・音声・ファイル、クライアント指定のtools、構造化出力、複数候補、warmup、steering、ResponsesのHTTP APIや保存済み応答の取得は未対応です。最新のメッセージが非テキストや空の場合はエラーにし、古い依頼を代わりに送信しません。
+- WebSocketは`response.create`に対する返信を扱います。dotsからの自発pushは既存の`on_received`で受信してください。コネクターはpushを返信として扱わず、処理済みにもしません。
+- 接続が切れたり待機がタイムアウトしても、送信済みのdotsへの依頼は継続します。HTTP応答の`X-Dots-Request-ID`、エラー内の`request_id`、WS完了・失敗応答の`metadata.dots_bridge_request_id`で状態を調べられます。
+- コネクターは依頼を自動再送しません。HTTPエラーでは公式SDK向けに`x-should-retry: false`を返します。切断後も再送を避けたい場合は呼び出し側で自動再試行を無効にし、HTTPでは同じ`Idempotency-Key`ヘッダーを付けて再実行できます（128文字以内）。
+- 入力全体は300 KiB、転送する最新のテキストは16,000文字までです。WSは処理中の1件に加え16件まで待機できます。ブラウザーからの異なるoriginへのアクセスは許可しません。
+
+Pythonアプリから直接起動する場合は、`dots_bridge.connectors.create_openai_connector(bridge_url, api_key=...)`がStarletteアプリを返します。
+コネクターを提供するためのOpenAI SDKやOpenAI APIキーは不要です。
+プロトコルは公式の[Chat Completionsストリーミング仕様](https://developers.openai.com/api/reference/resources/chat/subresources/completions/streaming-events)と[Responses WebSocket仕様](https://developers.openai.com/api/docs/guides/websocket-mode)を参照しています。
 
 ## HTTP API
 

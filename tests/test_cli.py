@@ -1,6 +1,8 @@
 import json
 import os
 import stat
+import sys
+from types import ModuleType
 
 import pytest
 
@@ -138,6 +140,130 @@ def test_serve_starts_one_worker_without_access_logs(config, monkeypatch):
             },
         )
     ]
+
+
+@pytest.fixture
+def connector_server(monkeypatch):
+    import uvicorn
+
+    sentinel = object()
+    seen = []
+    module = ModuleType("dots_bridge.connectors.openai")
+
+    def create_connector(bridge_url, **kwargs):
+        seen.append(("factory", bridge_url, kwargs))
+        return sentinel
+
+    module.create_openai_connector = create_connector
+    monkeypatch.setitem(sys.modules, "dots_bridge.connectors.openai", module)
+    monkeypatch.setattr(
+        uvicorn, "run", lambda app, **kwargs: seen.append(("run", app, kwargs))
+    )
+    return sentinel, seen
+
+
+def test_openai_connector_defaults_are_separate_from_bridge_server(config, connector_server):
+    sentinel, seen = connector_server
+    assert cli.main(["openai", "--config", str(config)]) == 0
+    assert seen == [
+        (
+            "factory",
+            "http://127.0.0.1:8765",
+            {
+                "api_key": Settings.from_file(config).api_key,
+                "channel": "default",
+                "subscription_id": None,
+                "reply_timeout": 120.0,
+            },
+        ),
+        (
+            "run",
+            sentinel,
+            {
+                "host": "127.0.0.1",
+                "port": 8766,
+                "workers": 1,
+                "access_log": False,
+                "ws_max_size": 300 * 1024,
+            },
+        ),
+    ]
+
+
+@pytest.mark.parametrize("global_url", [False, True])
+def test_openai_connector_passes_explicit_arguments(config, connector_server, global_url):
+    sentinel, seen = connector_server
+    url_arguments = ["--url", "http://127.0.0.1:9000"]
+    arguments = ["--config", str(config)]
+    if global_url:
+        arguments += url_arguments
+    arguments += ["openai"]
+    if not global_url:
+        arguments += url_arguments
+    arguments += [
+        "--host", "0.0.0.0",
+        "--port", "9001",
+        "--channel", "chat",
+        "--subscription-id", "sub_test",
+        "--reply-timeout", "17.5",
+    ]
+    assert cli.main(arguments) == 0
+    assert seen == [
+        (
+            "factory",
+            "http://127.0.0.1:9000",
+            {
+                "api_key": Settings.from_file(config).api_key,
+                "channel": "chat",
+                "subscription_id": "sub_test",
+                "reply_timeout": 17.5,
+            },
+        ),
+        (
+            "run",
+            sentinel,
+            {
+                "host": "0.0.0.0",
+                "port": 9001,
+                "workers": 1,
+                "access_log": False,
+                "ws_max_size": 300 * 1024,
+            },
+        ),
+    ]
+
+
+def test_openai_connector_default_bridge_url_uses_bridge_configuration(
+    config, connector_server, monkeypatch
+):
+    settings = Settings.from_file(config).model_copy(update={"host": "::", "port": 9000})
+    monkeypatch.setattr(Settings, "from_file", lambda path: settings)
+    assert cli.main(["openai", "--config", str(config)]) == 0
+    assert connector_server[1][0][1] == "http://127.0.0.1:9000"
+    assert connector_server[1][1][2]["port"] == 8766
+
+
+@pytest.mark.parametrize("port", ["0", "-1", "65536", "invalid", "1.5"])
+def test_openai_connector_rejects_invalid_ports_before_loading_configuration(port, monkeypatch):
+    def fail_load(path):
+        raise AssertionError("Configuration should not be loaded")
+
+    monkeypatch.setattr(Settings, "from_file", fail_load)
+    with pytest.raises(SystemExit) as caught:
+        cli.main(["openai", "--port", port])
+    assert caught.value.code == 2
+
+
+@pytest.mark.parametrize("port", [1, 65535])
+def test_openai_connector_accepts_port_boundaries(port):
+    assert cli._parser().parse_args(["openai", "--port", str(port)]).port == port
+
+
+@pytest.mark.parametrize("duration", ["0", "-1", "nan", "inf"])
+def test_openai_connector_rejects_invalid_reply_timeout(duration):
+    with pytest.raises(SystemExit) as caught:
+        cli.main(["openai", "--reply-timeout", duration])
+    assert caught.value.code == 2
 
 
 @pytest.mark.parametrize(

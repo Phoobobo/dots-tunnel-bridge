@@ -24,6 +24,16 @@ def _number(value: str) -> float:
         raise argparse.ArgumentTypeError(str(exc)) from None
 
 
+def _port(value: str) -> int:
+    try:
+        port = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("port must be an integer between 1 and 65535") from None
+    if not 1 <= port <= 65535:
+        raise argparse.ArgumentTypeError("port must be an integer between 1 and 65535")
+    return port
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dots-bridge",
@@ -45,6 +55,16 @@ def _parser() -> argparse.ArgumentParser:
     init = command("init", "Create a private configuration with generated keys")
     init.add_argument("--public-url", required=True, help="Public HTTPS origin, without /mcp")
     command("serve", "Run the bridge HTTP and MCP server")
+    openai = command("openai", "Run the OpenAI-compatible connector", remote=True)
+    openai.add_argument("--host", default="127.0.0.1", help="Connector bind host")
+    openai.add_argument(
+        "--port", type=_port, default=8766, help="Connector bind port (default: 8766)"
+    )
+    openai.add_argument("--channel", default="default")
+    openai.add_argument("--subscription-id")
+    openai.add_argument(
+        "--reply-timeout", type=_number, default=120.0, help="Reply wait seconds (default: 120)"
+    )
     command("subscriptions", "List active dots subscriptions", remote=True)
     send = command("send", "Queue a message for dots", remote=True)
     send.add_argument("text", metavar="TEXT")
@@ -126,6 +146,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 port=settings.port,
                 workers=1,
                 access_log=False,
+            )
+            return 0
+        if args.command == "openai":
+            import uvicorn
+
+            from .connectors.openai import create_openai_connector
+
+            uvicorn.run(
+                create_openai_connector(
+                    args.url or _local_url(settings),
+                    api_key=settings.api_key,
+                    channel=args.channel,
+                    subscription_id=args.subscription_id,
+                    reply_timeout=args.reply_timeout,
+                ),
+                host=args.host,
+                port=args.port,
+                workers=1,
+                access_log=False,
+                ws_max_size=300 * 1024,
             )
             return 0
         if args.command in {"prune", "revoke"}:
