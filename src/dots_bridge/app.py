@@ -18,6 +18,7 @@ from .auth import PersonalOAuth
 from .bridge import DotsBridge
 from .config import Settings
 from .errors import BridgeError
+from .herdr_tools import HerdrConfig, make_webhook_route
 from .mcp import create_mcp
 from .models import MessageInput, ReceivedAcknowledgement, ReceivedQuery
 
@@ -115,7 +116,9 @@ def create_app(
             owner_user_id=settings.owner_user_id,
         )
         auth.on_revoke = bridge.revoke_subscriptions
-    mcp = create_mcp(bridge, auth, no_auth=no_auth)
+    # Local addition: optional gbb/Herdr coding-agent tools and status receiver.
+    herdr = HerdrConfig.from_env()
+    mcp = create_mcp(bridge, auth, no_auth=no_auth, herdr=herdr)
     public = urlsplit(settings.public_base_url)
     local_origins = {
         f"http://127.0.0.1:{settings.port}",
@@ -275,6 +278,7 @@ def create_app(
             Route("/api/received", received),
             Route("/api/consumers/{consumer_id}", consumer_cursor),
             Route("/api/consumers/{consumer_id}/ack", acknowledge, methods=["POST"]),
+            *([make_webhook_route(bridge, herdr)] if herdr is not None else []),
             Mount("/", app=mcp_app),
         ],
         lifespan=lifespan,

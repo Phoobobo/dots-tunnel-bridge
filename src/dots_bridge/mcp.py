@@ -178,7 +178,11 @@ def _security_meta(scope: str) -> dict[str, Any]:
 
 
 def create_mcp(
-    bridge: BridgeBackend, auth: AuthProvider | None, *, no_auth: bool = False
+    bridge: BridgeBackend,
+    auth: AuthProvider | None,
+    *,
+    no_auth: bool = False,
+    herdr: Any = None,
 ) -> FastMCP:
     """Build the MCP endpoint used by dots, with draft webhook Events support."""
     mcp = FastMCP(
@@ -377,6 +381,12 @@ def create_mcp(
             )
         except BridgeError as exc:
             raise ToolError(f"{exc.code}: {exc.message}") from None
+
+    if herdr is not None:
+        # Local addition: gbb coding-agent tools (DOTS_BRIDGE_HERDR_TOOLS=1).
+        from .herdr_tools import register_herdr_tools
+
+        register_herdr_tools(mcp, herdr, meta=_meta("messages:reply"), auth=reply_auth)
 
     mcp.add_extension(_EventsExtension(bridge, authenticated=auth is not None))
     # FastMCP's public extension API registers the three draft methods. Its SDK
