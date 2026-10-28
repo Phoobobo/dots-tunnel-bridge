@@ -1,0 +1,91 @@
+#!/usr/bin/env python3
+"""dotctl: talk to the ChatGPT Dot through the local dots-bridge (127.0.0.1 only).
+
+  dotctl send "text" [--wait] [--timeout 300]   push a message to Dot (MCP Events)
+  dotctl inbox [--all] [--peek] [--json]        replies/progress/pushes from Dot
+  dotctl get REQUEST_ID                         status + responses for one request
+  dotctl subs                                   active Dot event subscriptions
+  dotctl status                                 bridge + tunnel health
+"""
+import os, sys
+
+# Run with the repo's .venv interpreter (works through a symlink in ~/.local/bin).
+_VENV_PY = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), ".venv", "bin", "python")
+if os.path.realpath(sys.executable) != os.path.realpath(_VENV_PY) and os.path.exists(_VENV_PY):
+    os.execv(_VENV_PY, [_VENV_PY, os.path.realpath(__file__), *sys.argv[1:]])
+
+import argparse, json, os, sys, urllib.request
+
+from dots_bridge.client import BridgeClient
+from dots_bridge.config import Settings
+
+CONFIG = os.path.expanduser(os.environ.get("DOTCTL_CONFIG", "~/.config/dots-bridge/bridge.toml"))
+CONSUMER = "dotctl"
+
+
+def out(v):
+    print(json.dumps(v, ensure_ascii=False, indent=2, default=str))
+
+
+def show(msgs, as_json):
+    if as_json:
+        out([m.model_dump() if hasattr(m, "model_dump") else m for m in msgs])
+        return
+    for m in msgs:
+        m = m.model_dump() if hasattr(m, "model_dump") else m
+        print(f"#{m['sequence']} [{m['kind']}] {m['received_at']} req={m.get('request_id') or '-'}")
+        print("  " + m["text"].replace("\n", "\n  "))
+    if not msgs:
+        print("(no messages)")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="dotctl")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("send"); s.add_argument("text"); s.add_argument("--wait", action="store_true")
+    s.add_argument("--timeout", type=float, default=300); s.add_argument("--channel", default="default")
+    i = sub.add_parser("inbox"); i.add_argument("--all", action="store_true", help="show everything")
+    i.add_argument("--peek", action="store_true", help="do not mark as read"); i.add_argument("--json", action="store_true")
+    g = sub.add_parser("get"); g.add_argument("request_id")
+    sub.add_parser("subs"); sub.add_parser("status")
+    a = p.parse_args()
+    st = Settings.from_file(CONFIG)
+    url = f"http://127.0.0.1:{st.port}"
+    if a.cmd == "status":
+        for name, u in (("bridge", url + "/health"), ("tunnel", "http://127.0.0.1:8080/readyz")):
+            try:
+                with urllib.request.urlopen(u, timeout=3) as r:
+                    print(f"{name}: HTTP {r.status} {r.read().decode()[:200]}")
+            except Exception as e:
+                print(f"{name}: DOWN ({e})")
+        return 0
+    with BridgeClient(url, api_key=st.api_key) as c:
+        if a.cmd == "send":
+            msg = c.send_message(a.text, channel=a.channel)
+            out(msg)
+            if a.wait:
+                out(c.wait_for_reply(msg["request_id"], timeout=a.timeout))
+        elif a.cmd == "inbox":
+            after = 0 if a.all else c.get_consumer_cursor(CONSUMER)
+            msgs, cur = [], after
+            while True:
+                page = c.list_received(after=cur, limit=100)
+                if not page:
+                    break
+                msgs += page; cur = page[-1].sequence
+            show(msgs, a.json)
+            if msgs and not a.peek and not a.all:
+                c.acknowledge_received(CONSUMER, msgs[-1].sequence)
+        elif a.cmd == "get":
+            out(c.get_message(a.request_id))
+            show(c.list_response_messages(a.request_id), False)
+        elif a.cmd == "subs":
+            out(c.list_subscriptions())
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:  # never dump config/keys
+        print(f"dotctl: {type(e).__name__}: {e}", file=sys.stderr); sys.exit(1)

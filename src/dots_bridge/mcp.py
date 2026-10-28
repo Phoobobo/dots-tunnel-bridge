@@ -177,7 +177,9 @@ def _security_meta(scope: str) -> dict[str, Any]:
     return {"securitySchemes": [{"type": "oauth2", "scopes": [scope]}]}
 
 
-def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
+def create_mcp(
+    bridge: BridgeBackend, auth: AuthProvider | None, *, no_auth: bool = False
+) -> FastMCP:
     """Build the MCP endpoint used by dots, with draft webhook Events support."""
     mcp = FastMCP(
         "dots-bridge",
@@ -212,10 +214,16 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
     read_auth = require_scopes("events:read") if auth is not None else None
     reply_auth = require_scopes("messages:reply") if auth is not None else None
 
+    def _meta(scope: str) -> dict[str, Any]:
+        # Local patch: advertise noauth when OAuth is disabled.
+        if no_auth:
+            return {"securitySchemes": [{"type": "noauth"}]}
+        return _security_meta(scope)
+
     @mcp.tool(
         annotations={"readOnlyHint": True, "openWorldHint": False},
         auth=read_auth,
-        meta=_security_meta("events:read"),
+        meta=_meta("events:read"),
     )
     async def get_current_user() -> dict[str, str]:
         """Return the connected application owner's ID."""
@@ -224,7 +232,7 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
     @mcp.tool(
         annotations={"readOnlyHint": True, "openWorldHint": False},
         auth=read_auth,
-        meta=_security_meta("events:read"),
+        meta=_meta("events:read"),
     )
     async def get_message(
         request_id: Annotated[str, Field(min_length=1, max_length=200)],
@@ -243,7 +251,7 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
             "openWorldHint": False,
         },
         auth=reply_auth,
-        meta=_security_meta("messages:reply"),
+        meta=_meta("messages:reply"),
     )
     async def reply_to_app(
         request_id: Annotated[str, Field(min_length=1, max_length=200)],
@@ -267,7 +275,7 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
             "openWorldHint": False,
         },
         auth=reply_auth,
-        meta=_security_meta("messages:reply"),
+        meta=_meta("messages:reply"),
     )
     async def report_progress(
         request_id: Annotated[str, Field(min_length=1, max_length=200)],
@@ -304,7 +312,7 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
             "openWorldHint": False,
         },
         auth=reply_auth,
-        meta=_security_meta("messages:reply"),
+        meta=_meta("messages:reply"),
     )
     async def cancel_request(
         request_id: Annotated[str, Field(min_length=1, max_length=200)],
@@ -333,7 +341,7 @@ def create_mcp(bridge: BridgeBackend, auth: AuthProvider | None) -> FastMCP:
             "openWorldHint": False,
         },
         auth=reply_auth,
-        meta=_security_meta("messages:reply"),
+        meta=_meta("messages:reply"),
     )
     async def send_to_app(
         text: Annotated[str, Field(min_length=1, max_length=64000)],

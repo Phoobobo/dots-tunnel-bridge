@@ -1,6 +1,7 @@
 """ASGI composition: FastMCP owns MCP/OAuth; Starlette adds the application API."""
 
 import json
+import os
 import secrets
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
@@ -95,16 +96,26 @@ def create_app(
     SQLite leases recover an interrupted delivery after at most 30 seconds.
     """
     bridge = bridge or DotsBridge(settings)
-    auth = PersonalOAuth(
-        db_path=settings.db_path,
-        public_base_url=settings.public_base_url,
-        owner_key=settings.owner_key,
-        redirect_uri=settings.redirect_uri,
-        client_id=settings.client_id,
-        owner_user_id=settings.owner_user_id,
-    )
-    auth.on_revoke = bridge.revoke_subscriptions
-    mcp = create_mcp(bridge, auth)
+    # Local patch: DOTS_BRIDGE_NO_AUTH=1 serves MCP without OAuth, for use behind
+    # OpenAI's Secure MCP Tunnel (no public URL). Loopback-only by construction.
+    no_auth = os.environ.get("DOTS_BRIDGE_NO_AUTH") == "1"
+    loopback = {"127.0.0.1", "localhost", "::1"}
+    if no_auth and (
+        settings.host not in loopback or urlsplit(settings.public_base_url).hostname not in loopback
+    ):
+        raise ValueError("DOTS_BRIDGE_NO_AUTH=1 requires loopback host and public_base_url")
+    auth = None
+    if not no_auth:
+        auth = PersonalOAuth(
+            db_path=settings.db_path,
+            public_base_url=settings.public_base_url,
+            owner_key=settings.owner_key,
+            redirect_uri=settings.redirect_uri,
+            client_id=settings.client_id,
+            owner_user_id=settings.owner_user_id,
+        )
+        auth.on_revoke = bridge.revoke_subscriptions
+    mcp = create_mcp(bridge, auth, no_auth=no_auth)
     public = urlsplit(settings.public_base_url)
     local_origins = {
         f"http://127.0.0.1:{settings.port}",
