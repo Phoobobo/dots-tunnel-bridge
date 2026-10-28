@@ -14,3 +14,6 @@ data/
 *.sqlite3
 *.sqlite3-*
 .DS_Store
+
+# local commit-hook logs
+.story/

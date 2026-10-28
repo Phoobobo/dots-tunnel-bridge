@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Render: sed -e "s#\$HOME#$HOME#g" -e "s#__LABEL_PREFIX__#com.example#g" \
+       -e "s#__REPO_DIR__#$HOME/dots-tunnel-bridge#g" deploy/dots-bridge.plist.template \
+       > ~/.config/dots-bridge/__LABEL_PREFIX__.dots-bridge.plist
+     Keep it OUTSIDE ~/Library/LaunchAgents so it does not auto-start at login. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL_PREFIX__.dots-bridge</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__REPO_DIR__/.venv/bin/dots-bridge</string>
+    <string>--config</string><string>$HOME/.config/dots-bridge/bridge.toml</string>
+    <string>serve</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <!-- Required: serve MCP without OAuth (refuses to start unless loopback). -->
+    <key>DOTS_BRIDGE_NO_AUTH</key><string>1</string>
+    <!-- Optional: gbb/Herdr coding-agent tools + /herdr/webhook receiver. -->
+    <!-- <key>DOTS_BRIDGE_HERDR_TOOLS</key><string>1</string> -->
+  </dict>
+  <key>WorkingDirectory</key><string>$HOME/.config/dots-bridge</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>$HOME/Library/Logs/dots-bridge/bridge.out.log</string>
+  <key>StandardErrorPath</key><string>$HOME/Library/Logs/dots-bridge/bridge.err.log</string>
+</dict>
+</plist>

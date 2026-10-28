@@ -1,0 +1,18 @@
+# ~/.config/dots-bridge/bridge.toml (chmod 600). Prefer generating it:
+#   .venv/bin/dots-bridge --config ~/.config/dots-bridge/bridge.toml init --public-url http://127.0.0.1:8765
+# which creates fresh random keys. Never commit the real file.
+public_base_url = "http://127.0.0.1:8765"   # must stay loopback in no-auth mode
+redirect_uri = ""                            # unused in no-auth mode
+client_id = "dots-bridge"
+owner_user_id = "owner"
+owner_key = "<RANDOM_32+_CHARS>"             # unused in no-auth mode, still required
+api_key = "<RANDOM_32+_CHARS_DIFFERENT>"     # local HTTP API bearer key (used by dotctl)
+storage_key = "<FERNET_KEY>"                 # encrypts webhook secrets at rest
+db_path = "data/bridge.sqlite3"
+host = "127.0.0.1"                           # must stay loopback in no-auth mode
+port = 8765
+subscription_ttl_seconds = 86400
+reply_timeout_seconds = 3600
+max_delivery_attempts = 5
+retry_base_seconds = 1.0
+worker_interval_seconds = 0.5

@@ -1,0 +1,20 @@
+# tunnel-client profile "dot". Install to ~/.config/tunnel-client/dot.yaml (mode 600),
+# or generate with:
+#   tunnel-client init --profile dot --tunnel-id <TUNNEL_ID> \
+#     --mcp-server-url http://127.0.0.1:8765/mcp --health-listen-addr 127.0.0.1:8080
+config_version: 1
+control_plane:
+  base_url: "https://api.openai.com"
+  tunnel_id: "<TUNNEL_ID>"
+  api_key: "env:CONTROL_PLANE_API_KEY"   # read from the environment, never inline
+health:
+  listen_addr: "127.0.0.1:8080"         # loopback only (healthz/readyz/admin UI)
+admin_ui:
+  open_browser: false
+log:
+  level: info
+  format: json
+mcp:
+  server_urls:
+    - channel: main
+      url: "http://127.0.0.1:8765/mcp"  # dots-bridge
