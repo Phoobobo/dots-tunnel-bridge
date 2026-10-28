@@ -64,6 +64,13 @@ dotctl get <request_id> # message status JSON + its progress/reply messages
 | `dotctl: ConnectError: ...` (connection refused / all connection attempts failed) | bridge not running → report |
 | `dotctl: FileNotFoundError: ...bridge.toml` | not installed / wrong `DOTCTL_CONFIG` |
 
+## Herdr / gbb tools (optional)
+
+When the bridge runs with `DOTS_BRIDGE_HERDR_TOOLS=1`, the Dot also has 12 `gbb_*` MCP tools that drive coding agents through [gbb](https://github.com/Phoobobo/grokbot-bridge-herdr), and gbb status changes arrive at the Dot as `app.message.created` on channel `herdr` (else `default`) with `metadata.source = "herdr"`. See [docs/HERDR.md](docs/HERDR.md). For local agents:
+
+- Do not POST to `/herdr/webhook` yourself and never read or print `~/.config/dots-bridge/herdr_webhook_token`; only gbb's `[[extra_webhooks]]` should use it.
+- Changes to `herdr_tools.py` must keep: managed panes only, protected workspaces refused unless handed over, no `herdr server stop`, argv-only subprocesses with timeouts, `gbb_wait` <= 120 s, and the draft-PR-only policy on `gbb_launch`. Run `.venv/bin/ruff check .` and `.venv/bin/pytest` (incl. `tests/test_herdr_tools.py`), then Refresh tools in ChatGPT.
+
 ## Never
 
 - Never print, log, or pass in argv the contents of `bridge.toml`, `secret.env`, or any API key / token file.
