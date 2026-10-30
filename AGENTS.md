@@ -66,10 +66,11 @@ dotctl get <request_id> # message status JSON + its progress/reply messages
 
 ## Herdr / gbb tools (optional)
 
-When the bridge runs with `DOTS_BRIDGE_HERDR_TOOLS=1`, the Dot also has 12 `gbb_*` MCP tools that drive coding agents through [gbb](https://github.com/Phoobobo/grokbot-bridge-herdr), and gbb status changes arrive at the Dot as `app.message.created` on channel `herdr` (else `default`) with `metadata.source = "herdr"`. See [docs/HERDR.md](docs/HERDR.md). For local agents:
+When the bridge runs with `DOTS_BRIDGE_HERDR_TOOLS=1`, the Dot also has 13 `gbb_*` MCP tools that drive coding agents through [gbb](https://github.com/Phoobobo/grokbot-bridge-herdr), and gbb status changes arrive at the Dot as `app.message.created` on channel `herdr` (else `default`) with `metadata.source = "herdr"`. See [docs/HERDR.md](docs/HERDR.md). For local agents:
 
-- Do not POST to `/herdr/webhook` yourself and never read or print `~/.config/dots-bridge/herdr_webhook_token`; only gbb's `[[extra_webhooks]]` should use it.
-- Changes to `herdr_tools.py` must keep: managed panes only, protected workspaces refused unless handed over, no `herdr server stop`, argv-only subprocesses with timeouts, `gbb_wait` <= 120 s, and the draft-PR-only policy on `gbb_launch`. Run `.venv/bin/ruff check .` and `.venv/bin/pytest` (incl. `tests/test_herdr_tools.py`), then Refresh tools in ChatGPT.
+- Do not POST to `/herdr/webhook` yourself and never read or print `~/.config/dots-bridge/herdr_webhook_token`; only gbb's `[[owners]]` dot target / `[[extra_webhooks]]` should use it.
+- Answer Codex menus and startup dialogs (`blocked_reason` question / hooks_review / dialog, or `state=startup_blocked` from launch) with `gbb_answer`, not by typing with `gbb_send`; resubmit a held launch prompt with `gbb_send pending=true`. Never pick options that opt in to data sharing. Events with `route = "extra"` for another owner are FYI only.
+- Changes to `herdr_tools.py` must keep: managed panes only, protected workspaces refused unless handed over, no `herdr server stop`, argv-only subprocesses with timeouts, `gbb_wait` <= 120 s, the draft-PR-only policy on `gbb_launch`, and `--owner` (from `DOTS_BRIDGE_GBB_OWNER`, default `dot`) on launch/handover. Run `.venv/bin/ruff check .` and `.venv/bin/pytest` (incl. `tests/test_herdr_tools.py`), then Refresh tools in ChatGPT.
 
 ## Never
 

@@ -18,6 +18,7 @@ from dots_bridge.herdr_tools import (
     DRAFT_PR_POLICY,
     WEBHOOK_TOKEN_HEADER,
     HerdrConfig,
+    event_text,
     make_runner,
     make_webhook_route,
     tool_path,
@@ -39,6 +40,7 @@ GBB_TOOLS = {
     "gbb_wait",
     "gbb_launch",
     "gbb_send",
+    "gbb_answer",
     "gbb_keys",
     "gbb_stop",
     "gbb_handover",
@@ -110,6 +112,12 @@ def test_disabled_by_default():
     )
     assert cfg is not None and cfg.protected_workspaces == {"a", "b"}
     assert cfg.channels == ("herdr", "default")
+    assert cfg.owner == "dot"
+    on = {"DOTS_BRIDGE_HERDR_TOOLS": "1"}
+    assert HerdrConfig.from_env({**on, "DOTS_BRIDGE_GBB_OWNER": "dot-2"}).owner == "dot-2"
+    assert HerdrConfig.from_env({**on, "DOTS_BRIDGE_GBB_OWNER": ""}).owner is None
+    with pytest.raises(ValueError):
+        HerdrConfig.from_env({**on, "DOTS_BRIDGE_GBB_OWNER": "--bad owner"})
 
 
 def test_tool_path_includes_user_and_homebrew_bins():
@@ -210,9 +218,39 @@ async def test_launch_appends_draft_pr_policy_and_validates(tmp_path):
         "--task",
         "dots-smoke",
     ]
-    assert args[-2] == "--prompt" and args[-1] == "print hello" + DRAFT_PR_POLICY
-    assert "draft" in args[-1] and limit == 300
+    assert args[-4] == "--prompt" and args[-3] == "print hello" + DRAFT_PR_POLICY
+    assert args[-2:] == ["--owner", "dot"]
+    assert "draft" in args[-3] and limit == 300
     assert "--no-worktree" in args2 and args2[args2.index("--base") + 1] == "main"
+
+
+async def test_launch_without_owner_keeps_old_argv(tmp_path):
+    runner = FakeRunner()
+    async with rpc(config(runner, owner=None)) as (_, tool):
+        await tool("gbb_launch", repo=str(tmp_path), task="t1", prompt="x", worktree=False)
+        await tool("gbb_handover", pane="w12:p3")
+    (launch,), (handover,) = [c[0] for c in runner.calls[:1]], [c[0] for c in runner.calls[1:]]
+    assert "--owner" not in launch and launch[-2] == "--prompt"
+    assert handover == ["handover", "--pane", "w12:p3"]
+
+
+async def test_answer_and_pending_send():
+    runner = FakeRunner()
+    async with rpc(config(runner)) as (_, tool):
+        assert (await tool("gbb_answer", target="mine", choice="Continue without trusting"))[
+            "isError"
+        ] is False
+        assert (await tool("gbb_answer", target="mine", choice="2"))["isError"] is False
+        assert (await tool("gbb_answer", target="mine", choice="--pending"))["isError"] is True
+        assert (await tool("gbb_answer", target="wAS:p1", choice="1"))["isError"] is True
+        assert (await tool("gbb_answer", target="odd", choice="1"))["isError"] is True
+        assert (await tool("gbb_send", target="mine", pending=True))["isError"] is False
+        assert (await tool("gbb_send", target="mine"))["isError"] is True
+    assert [c[0] for c in runner.non_list()] == [
+        ["answer", "mine", "Continue without trusting"],
+        ["answer", "mine", "2"],
+        ["send", "mine", "--pending"],
+    ]
 
 
 async def test_control_tools_refuse_unmanaged_and_protected_panes():
@@ -236,7 +274,7 @@ async def test_control_tools_refuse_unmanaged_and_protected_panes():
         ["send", "mine", "continue"],
         ["keys", "ho-was", "down", "enter"],
         ["stop", "mine"],
-        ["handover", "--pane", "w12:p3", "--note", "fix it"],
+        ["handover", "--pane", "w12:p3", "--note", "fix it", "--owner", "dot"],
         ["reclaim", "--pane", "w9:p1"],
     ]
 
@@ -328,3 +366,45 @@ async def test_webhook_receiver_forwards_status_to_first_subscribed_channel(tmp_
     async with receiver(backend, tmp_path / "missing") as http:
         response = await http.post("/herdr/webhook", content=body, headers=headers)
         assert response.status_code == 503
+
+
+def test_event_text_hints_by_blocked_reason_and_owner():
+    base = {"event": "agent_status", "status": "blocked", "task_id": "t1"}
+    assert "gbb_answer" in event_text({**base, "blocked_reason": "hooks_review"})
+    assert "Continue without trusting" in event_text({**base, "blocked_reason": "hooks_review"})
+    assert "gbb_answer" in event_text({**base, "blocked_reason": "question"})
+    assert "pending=true" in event_text({**base, "blocked_reason": "prompt_not_submitted"})
+    held = event_text({**base, "blocked_reason": "hooks_review", "prompt_pending": True})
+    assert "launch prompt is saved" in held
+    assert "gbb_answer" in event_text(base) and "gbb_send" in event_text(base)
+    mine = {**base, "owner": "dot", "route": "owner"}
+    assert "FYI" not in event_text(mine)
+    other = {**base, "owner": "canmouzhang", "route": "extra"}
+    assert "FYI only" in event_text(other) and "canmouzhang" in event_text(other)
+    assert "FYI" not in event_text({**base, "route": "extra"})
+
+
+async def test_webhook_receiver_keeps_owner_and_route_fields(tmp_path):
+    token = "t" * 40
+    token_file = tmp_path / "token"
+    token_file.write_text(token)
+    backend = SendBackend({"herdr"})
+    event = {
+        **EVENT,
+        "status": "blocked",
+        "owner": "dot",
+        "route": "owner",
+        "blocked_reason": "hooks_review",
+        "prompt_pending": True,
+        "herdr_status": "idle",
+        "fallback_reason": None,
+    }
+    async with receiver(backend, token_file) as http:
+        headers = {WEBHOOK_TOKEN_HEADER: token}
+        response = await http.post("/herdr/webhook", content=json.dumps(event), headers=headers)
+        assert response.status_code == 202
+    (sent,) = backend.sent
+    meta = sent["metadata"]
+    assert meta["owner"] == "dot" and meta["route"] == "owner"
+    assert meta["blocked_reason"] == "hooks_review" and meta["prompt_pending"] is True
+    assert meta["herdr_status"] == "idle" and "gbb_answer" in sent["text"]

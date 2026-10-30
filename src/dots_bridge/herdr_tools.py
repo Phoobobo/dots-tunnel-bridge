@@ -23,6 +23,10 @@ Environment:
   DOTS_BRIDGE_HERDR_WEBHOOK_TOKEN_FILE       receiver token file
                                              (default ~/.config/dots-bridge/herdr_webhook_token)
   DOTS_BRIDGE_HERDR_CHANNELS                 preferred event channels (default herdr,default)
+  DOTS_BRIDGE_GBB_OWNER                      owner recorded on tasks launched / handed over from
+                                             here (default "dot"; empty = none). gbb sends their
+                                             status callbacks to its [[owners]] target of that name
+                                             and falls back to its primary webhook.
 """
 
 from __future__ import annotations
@@ -71,6 +75,8 @@ PANE_RE = re.compile(r"^[A-Za-z0-9]{1,20}:[A-Za-z0-9]{1,20}$")
 TASK_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$")
 KEY_RE = re.compile(r"^[A-Za-z0-9+_-]{1,20}$")
+OWNER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,39}$")  # same as gbb's OWNER_RE
+DEFAULT_OWNER = "dot"
 
 Runner = Callable[[Sequence[str], float], Awaitable[dict[str, Any]]]
 
@@ -113,6 +119,7 @@ class HerdrConfig:
     protected_workspaces: frozenset[str] = frozenset(DEFAULT_PROTECTED)
     channels: tuple[str, ...] = DEFAULT_CHANNELS
     webhook_token_file: Path | None = None
+    owner: str | None = DEFAULT_OWNER
     extra_env: dict[str, str] = field(default_factory=dict)
     runner: Runner | None = None  # injectable for tests
 
@@ -128,8 +135,12 @@ class HerdrConfig:
         token_file = env.get("DOTS_BRIDGE_HERDR_WEBHOOK_TOKEN_FILE") or str(
             Path.home() / ".config/dots-bridge/herdr_webhook_token"
         )
+        owner = env.get("DOTS_BRIDGE_GBB_OWNER", DEFAULT_OWNER).strip() or None
+        if owner is not None and not OWNER_RE.fullmatch(owner):
+            raise ValueError("DOTS_BRIDGE_GBB_OWNER must match " + OWNER_RE.pattern)
         return cls(
             gbb_bin=gbb,
+            owner=owner,
             path=path,
             protected_workspaces=frozenset(
                 _split(env.get("DOTS_BRIDGE_HERDR_PROTECTED_WORKSPACES"), DEFAULT_PROTECTED)
@@ -303,7 +314,7 @@ def register_herdr_tools(
         """Read the recent terminal output of a managed agent's pane.
 
         Use this to see what the agent is doing or asking (for example a blocked
-        permission prompt) before you answer it with gbb_send or gbb_keys.
+        permission prompt) before you answer it with gbb_answer, gbb_send or gbb_keys.
         """
         args = ["read", _check(TARGET_RE, target, "target"), "--lines", str(lines)]
         if visible:
@@ -399,21 +410,61 @@ def register_herdr_tools(
         if base:
             args += ["--base", _check(BRANCH_RE, base, "base")]
         args += ["--prompt", _clean_text(prompt, "prompt") + DRAFT_PR_POLICY]
+        if config.owner:
+            args += ["--owner", config.owner]
         return await run(args, LAUNCH_TIMEOUT_SECONDS)
 
     @tool(read_only=False, destructive=False, world=True)
     async def gbb_send(
         target: Annotated[str, Field(description="Task id or pane id of a managed agent")],
-        text: Annotated[str, Field(min_length=1, max_length=16000)],
+        text: Annotated[str | None, Field(min_length=1, max_length=16000)] = None,
+        pending: Annotated[
+            bool, Field(description="Resubmit the launch prompt saved by gbb (startup_blocked)")
+        ] = False,
     ) -> dict[str, Any]:
         """Send a follow-up message or answer to a managed coding agent and submit it.
 
-        Use this to give an agent more instructions or answer its question. Refuses panes
-        that gbb does not manage and the user's own workspaces.
+        Use this to give an agent more instructions or answer a free-text question. A
+        multiple-choice question or startup dialog must be answered with gbb_answer instead
+        (gbb refuses to type into it and says so). pending=true resubmits the launch prompt
+        that gbb saved when a startup dialog blocked it (text is then ignored). Refuses
+        panes that gbb does not manage and the user's own workspaces.
         """
         target = _check(TARGET_RE, target, "target")
         await managed_entry(target, "send text")
+        if pending:
+            return await run(["send", target, "--pending"], SEND_TIMEOUT_SECONDS)
+        if text is None:
+            raise ToolError("invalid_argument: text is required unless pending=true")
         return await run(["send", target, _clean_text(text, "text")], SEND_TIMEOUT_SECONDS)
+
+    @tool(read_only=False, destructive=False, world=True)
+    async def gbb_answer(
+        target: Annotated[str, Field(description="Task id or pane id of a managed agent")],
+        choice: Annotated[
+            str,
+            Field(
+                min_length=1,
+                max_length=200,
+                description="Option number ('2') or (part of) its label, as shown by gbb_read",
+            ),
+        ],
+    ) -> dict[str, Any]:
+        """Pick an option in a Codex question or startup dialog (e.g. 'Hooks need review').
+
+        Use this when a status event says blocked with blocked_reason question,
+        hooks_review or dialog, or gbb_send refuses with agent_blocked. gbb opens a queued
+        question, moves to the option, verifies the selection and presses enter; if the
+        launch prompt was held back by the dialog it is submitted afterwards. Never pick
+        options that opt in to data sharing; for hooks prefer 'Continue without trusting'
+        unless the user said to trust them. Refuses unmanaged panes.
+        """
+        target = _check(TARGET_RE, target, "target")
+        choice = _clean_text(choice, "choice").strip()
+        if choice.startswith("-"):
+            raise ToolError("invalid_argument: choice must not start with '-'")
+        await managed_entry(target, "answer a question")
+        return await run(["answer", target, choice], SEND_TIMEOUT_SECONDS)
 
     @tool(read_only=False, destructive=True, world=True)
     async def gbb_keys(
@@ -468,6 +519,8 @@ def register_herdr_tools(
         args = ["handover", "--pane", pane]
         if note:
             args += ["--note", _clean_text(note, "note")]
+        if config.owner:
+            args += ["--owner", config.owner]
         return await run(args, DEFAULT_TIMEOUT_SECONDS)
 
     @tool(read_only=False, destructive=False, idempotent=True)
@@ -486,7 +539,9 @@ def register_herdr_tools(
         " Local coding agents: the gbb_* tools drive codex/grok agents in Herdr on the "
         "owner's Mac. Launch only when the owner asks for local coding work; each task gets "
         "its own worktree and Herdr workspace. Poll with gbb_wait (max 120 s) or gbb_status, "
-        "review with gbb_result, and gbb_stop when finished. Agents may open draft pull "
+        "review with gbb_result, and gbb_stop when finished. If gbb_launch returns "
+        "state=startup_blocked or an agent is blocked on a menu, answer it with gbb_answer "
+        "(not gbb_send). Agents may open draft pull "
         "requests only. Never touch panes that gbb does not manage or the owner's own "
         "workspaces. Status changes may also arrive as app.message.created events whose "
         "metadata.source is 'herdr'; those need no reply beyond a brief acknowledgement."
@@ -509,18 +564,41 @@ _EVENT_FIELDS = (
     "hostname",
     "ts",
     "note",
+    "owner",
+    "route",
+    "blocked_reason",
+    "fallback_reason",
+    "prompt_pending",
+    "herdr_status",
 )
 
+_BLOCKED_HINTS = {
+    "hooks_review": "Codex is asking to review its hooks at startup; answer with gbb_answer "
+    "(e.g. 'Continue without trusting' unless the owner said to trust them).",
+    "question": "The agent asked a multiple-choice question; read it with gbb_read and pick "
+    "an option with gbb_answer.",
+    "dialog": "A dialog is open; read it with gbb_read and pick an option with gbb_answer.",
+    "prompt_not_submitted": "The launch prompt never reached the agent; check gbb_read, then "
+    "gbb_send with pending=true.",
+}
 
-def event_text(data: dict[str, Any]) -> str:
+
+def event_text(data: dict[str, Any], owner: str | None = DEFAULT_OWNER) -> str:
     task = data.get("task_id") or data.get("pane_id") or "unknown task"
     kind = f" ({data['agent_kind']})" if data.get("agent_kind") else ""
     status = f": {data['status']}" if data.get("status") else ""
     hint = {
         "done": "Review with gbb_result, then tell the owner.",
         "idle": "The agent is waiting; check gbb_read / gbb_result.",
-        "blocked": "The agent needs input; read it with gbb_read and answer with gbb_send.",
+        "blocked": "The agent needs input; read it with gbb_read, then gbb_answer for a menu "
+        "or gbb_send for free text.",
     }.get(data.get("status") or "", "Check with gbb_status if needed.")
+    if data.get("status") == "blocked" and data.get("blocked_reason") in _BLOCKED_HINTS:
+        hint = _BLOCKED_HINTS[data["blocked_reason"]]
+    if data.get("prompt_pending") is True and data.get("blocked_reason") != "prompt_not_submitted":
+        hint += " The launch prompt is saved and is sent after the dialog is answered."
+    if data.get("route") == "extra" and data.get("owner") and data.get("owner") != owner:
+        hint = f"FYI only: this task belongs to {data['owner']}, not you; no action needed."
     return f"[herdr] {task}{kind} {data.get('event')}{status}. {hint}"
 
 
@@ -554,7 +632,10 @@ def make_webhook_route(bridge: Any, config: HerdrConfig) -> Route:
         for channel in config.channels:
             try:
                 message = await bridge.send_message(
-                    event_text(data), channel=channel, metadata=metadata, idempotency_key=key
+                    event_text(data, config.owner),
+                    channel=channel,
+                    metadata=metadata,
+                    idempotency_key=key,
                 )
             except BridgeError as exc:
                 if exc.code == "no_subscription":

@@ -18,7 +18,7 @@ flowchart LR
 |---|---|
 | `DOTS_BRIDGE_NO_AUTH=1` | MCP 不走 OAuth（Tunnel 侧选 *No authentication*）。`host` 或 `public_base_url` 不是 loopback 时**拒绝启动**。 |
 | `local/dotctl` | 小 CLI：`send / inbox / get / subs / status`。 |
-| `DOTS_BRIDGE_HERDR_TOOLS=1`（可选） | gbb/Herdr coding-agent 工具（12 个 `gbb_*`）+ `POST /herdr/webhook`（loopback + token 文件）。见下文 [gbb / Herdr 集成](#gbb--herdr-集成可选) 和 [docs/HERDR.md](docs/HERDR.md)。 |
+| `DOTS_BRIDGE_HERDR_TOOLS=1`（可选） | gbb/Herdr coding-agent 工具（13 个 `gbb_*`）+ `POST /herdr/webhook`（loopback + token 文件）。见下文 [gbb / Herdr 集成](#gbb--herdr-集成可选) 和 [docs/HERDR.md](docs/HERDR.md)。 |
 | `deploy/` | LaunchAgent plist、tunnel-client `dot.yaml`、`bridge.toml`、`secret.env` 模板（无真实值）。 |
 
 ## 安装（人工步骤）
@@ -42,10 +42,10 @@ flowchart LR
 
 让 Dot 驱动你 Mac 上的编码 agent（codex / grok）。**gbb** 即 [grokbot-bridge-herdr](https://github.com/Phoobobo/grokbot-bridge-herdr)：[Herdr](https://herdr.dev) 插件 + `gbb` CLI（原本给 Grok Bot 用，Dot 经本 bridge 共用它）。设 `DOTS_BRIDGE_HERDR_TOOLS=1` 才启用，否则行为与上游一致。完整说明（中文 / English）：[docs/HERDR.md](docs/HERDR.md)。
 
-- **12 个工具**：只读 `gbb_list` / `gbb_status` / `gbb_read` / `gbb_result` / `gbb_doctor` / `gbb_wait`（最长 120 秒）；`gbb_launch`（自动在 prompt 末尾追加“只开 draft PR”规则）；`gbb_send` / `gbb_keys` / `gbb_stop` / `gbb_handover` / `gbb_reclaim`。
+- **13 个工具**：只读 `gbb_list` / `gbb_status` / `gbb_read` / `gbb_result` / `gbb_doctor` / `gbb_wait`（最长 120 秒）；`gbb_launch`（自动在 prompt 末尾追加“只开 draft PR”规则）；`gbb_send` / `gbb_answer`（回答 Codex 选择题/启动对话框）/ `gbb_keys` / `gbb_stop` / `gbb_handover` / `gbb_reclaim`。
 - **安全**：只作用于 gbb 托管的窗格；用户工作区（默认 `wAS,wAT`）除非主动交接一律拒绝；从不执行 `herdr server stop`；子进程只用 argv（不经 shell），带超时和输入校验。
-- **状态推送**：gbb 的 `[[extra_webhooks]]` → `POST http://127.0.0.1:8765/herdr/webhook`（只收本机请求，header `X-Dots-Herdr-Token` = `~/.config/dots-bridge/herdr_webhook_token` 的内容）→ Dot 收到 channel `herdr`（未订阅则 `default`）的 `app.message.created`，`metadata.source = "herdr"`。
-- **启用**：装 gbb（`gbb doctor`）→ 生成 token 文件（600）→ plist 里打开 `DOTS_BRIDGE_HERDR_TOOLS=1` 并重启 bridge → gbb 配置末尾加 `[[extra_webhooks]]` → ChatGPT 插件页 **Refresh** 工具 → 让 Dot 订阅 `app.message.created`（channel `herdr`）。
+- **状态推送**：launch/handover 带 `--owner dot`，gbb 的 `[[owners]] name="dot"`（或 `[[extra_webhooks]]` 镜像全部任务）→ `POST http://127.0.0.1:8765/herdr/webhook`（只收本机请求，header `X-Dots-Herdr-Token` = `~/.config/dots-bridge/herdr_webhook_token` 的内容）→ Dot 收到 channel `herdr`（未订阅则 `default`）的 `app.message.created`，`metadata.source = "herdr"`。
+- **启用**：装 gbb（`gbb doctor`）→ 生成 token 文件（600）→ plist 里打开 `DOTS_BRIDGE_HERDR_TOOLS=1` 并重启 bridge → gbb 配置末尾加 `[[owners]] name="dot"` → ChatGPT 插件页 **Refresh** 工具 → 让 Dot 订阅 `app.message.created`（channel `herdr`）。
 
 English: optional gbb/Herdr coding-agent tools for the Dot; see [docs/HERDR.md](docs/HERDR.md#english).
 
